@@ -1,0 +1,46 @@
+# Continuous integration for tg-ping.
+#
+# Author: Dr. Denys Dutykh (Mathematics Department, Khalifa University of
+#         Science and Technology, Abu Dhabi, UAE).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint
+        run: shellcheck -x bin/tg-ping install.sh tests/run-tests.sh tests/stub/curl
+
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the offline test suite
+        run: tests/run-tests.sh
+      - name: Check that the help text renders
+        run: |
+          bin/tg-ping --help
+          bin/tg-ping cheatsheet
+          bin/tg-ping hook claude
+
+  tests-without-jq:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Remove jq to exercise the fallback reader
+        run: sudo rm -f "$(command -v jq)"
+      - name: Run the offline test suite
+        run: tests/run-tests.sh

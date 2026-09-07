@@ -1,0 +1,25 @@
+# Author: Dr. Denys Dutykh (Mathematics Department, Khalifa University of
+#         Science and Technology, Abu Dhabi, UAE).
+
+# Credentials. Never commit these.
+.env
+.tg-ping.env
+*.env
+!.env.example
+/config
+*.token
+
+# Test and build leftovers
+/tmp/
+*.log
+*.bak
+*.orig
+*.rej
+
+# Editors and platforms
+.DS_Store
+*~
+.idea/
+.vscode/
+__pycache__/
+*.pyc

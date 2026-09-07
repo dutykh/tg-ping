@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+#
+# A stand in for curl, used by the offline test suite of tg-ping.
+#
+# Author: Dr. Denys Dutykh (Mathematics Department, Khalifa University of
+#         Science and Technology, Abu Dhabi, UAE).
+#
+# It parses the configuration file that tg-ping writes, records the request in
+# $TGP_CAPTURE, and answers with canned Telegram JSON. Behaviour is steered by
+#   TGP_STUB_DIR       directory holding <method>.response files
+#   TGP_STUB_HTTP      HTTP status to report (default 200)
+#   TGP_STUB_SCRIPT    file with one "status<TAB>body" line per attempt
+#   TGP_STUB_ASK       echo the callback_data of the last keyboard back as an update
+
+set -u
+
+cfg=""
+prev=""
+for arg in "$@"; do
+    case "$prev" in
+        --config|-K) cfg="$arg" ;;
+    esac
+    prev="$arg"
+done
+
+# Anything that is not a configuration driven call (the remote math renderer)
+# is answered with an empty success.
+if [ -z "$cfg" ] || [ ! -r "$cfg" ]; then
+    printf '200'
+    exit 0
+fi
+
+url=""; out=""; method=""
+fields_names=(); fields_values=(); uploads=()
+
+unquote() {
+    local v="$1"
+    v=${v#\"}; v=${v%\"}
+    printf '%s' "$v"
+}
+
+while IFS= read -r line; do
+    case "$line" in
+        url\ =\ *)  url=$(unquote "${line#url = }") ;;
+        output\ =\ *) out=$(unquote "${line#output = }") ;;
+        data-urlencode\ =\ *)
+            spec=$(unquote "${line#data-urlencode = }")
+            name=${spec%%@*}; path=${spec#*@}
+            fields_names[${#fields_names[@]}]="$name"
+            fields_values[${#fields_values[@]}]="$(cat "$path" 2>/dev/null)"
+            ;;
+        form\ =\ *)
+            spec=$(unquote "${line#form = }")
+            name=${spec%%=*}; rest=${spec#*=}
+            case "$rest" in
+                '<'*) path=${rest#<}
+                      fields_names[${#fields_names[@]}]="$name"
+                      fields_values[${#fields_values[@]}]="$(cat "$path" 2>/dev/null)" ;;
+                '@'*) uploads[${#uploads[@]}]="$name=${rest#@}" ;;
+            esac
+            ;;
+    esac
+done < "$cfg"
+
+method=${url##*/}
+
+if [ -n "${TGP_CAPTURE:-}" ]; then
+    {
+        printf 'METHOD\t%s\n' "$method"
+        i=0
+        while [ "$i" -lt "${#fields_names[@]}" ]; do
+            printf 'FIELD\t%s\t%s\n' "${fields_names[$i]}" \
+                "$(printf '%s' "${fields_values[$i]}" | awk 'BEGIN{ORS=""}{if(NR>1)printf "\\n"; print}')"
+            i=$(( i + 1 ))
+        done
+        for u in ${uploads[@]+"${uploads[@]}"}; do printf 'UPLOAD\t%s\n' "$u"; done
+        printf 'END\n'
+    } >> "$TGP_CAPTURE"
+    mkdir -p "$TGP_CAPTURE.d"
+    i=0
+    while [ "$i" -lt "${#fields_names[@]}" ]; do
+        printf '%s' "${fields_values[$i]}" > "$TGP_CAPTURE.d/${method}.${fields_names[$i]}"
+        i=$(( i + 1 ))
+    done
+fi
+
+status="${TGP_STUB_HTTP:-200}"
+body='{"ok":true,"result":{"message_id":4242,"chat":{"id":-100123}}}'
+
+if [ -n "${TGP_STUB_SCRIPT:-}" ] && [ -r "$TGP_STUB_SCRIPT" ]; then
+    n=$(cat "${TGP_STUB_SCRIPT}.count" 2>/dev/null || echo 0)
+    n=$(( n + 1 ))
+    printf '%s' "$n" > "${TGP_STUB_SCRIPT}.count"
+    line=$(sed -n "${n}p" "$TGP_STUB_SCRIPT")
+    if [ -n "$line" ]; then
+        status=$(printf '%s' "$line" | cut -f1)
+        body=$(printf '%s' "$line" | cut -f2-)
+    fi
+elif [ -n "${TGP_STUB_DIR:-}" ] && [ -r "$TGP_STUB_DIR/$method.response" ]; then
+    body=$(cat "$TGP_STUB_DIR/$method.response")
+fi
+
+if [ "$method" = "getUpdates" ] && [ "${TGP_STUB_ASK:-0}" = "1" ]; then
+    data=$(grep -o '"callback_data":"[^"]*"' "$TGP_CAPTURE.d/sendMessage.reply_markup" 2>/dev/null |
+           head -n1 | cut -d'"' -f4)
+    if [ -n "$data" ]; then
+        body='{"ok":true,"result":[{"update_id":10,"callback_query":{"id":"cb1","from":{"id":77},"message":{"message_id":4242,"chat":{"id":-100123}},"data":"'"$data"'"}}]}'
+        : > "$TGP_CAPTURE.d/sendMessage.reply_markup"
+    else
+        body='{"ok":true,"result":[]}'
+    fi
+fi
+
+[ -n "$out" ] && printf '%s' "$body" > "$out"
+printf '%s' "$status"
+case "$status" in 2*) exit 0 ;; *) exit 22 ;; esac

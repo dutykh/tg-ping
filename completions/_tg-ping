@@ -1,0 +1,34 @@
+#compdef tg-ping
+# Zsh completion for tg-ping.
+# Author: Dr. Denys Dutykh (Mathematics Department, Khalifa University of
+#         Science and Technology, Abu Dhabi, UAE).
+#compdef tg-ping
+_tg_ping() {
+    local -a commands
+    commands=(
+        'send:send a text message'
+        'code:send a snippet or file as a code block'
+        'table:send aligned CSV or TSV rows'
+        'math:typeset a formula and send it as an image'
+        'photo:send images, several become an album'
+        'file:send a document'
+        'media:send up to ten files as one album'
+        'run:run a command and report the outcome'
+        'progress:keep one message updated in place'
+        'ask:ask a question and wait for the answer'
+        'poll:send a native poll'
+        'init:interactive setup'
+        'doctor:check the installation'
+        'chats:list known chat ids'
+        'config:show the active configuration'
+        'hook:print integration snippets'
+        'cheatsheet:one screen reference'
+        'completion:print shell completion'
+    )
+    if (( CURRENT == 2 )); then
+        _describe 'command' commands
+    else
+        _files
+    fi
+}
+_tg_ping "$@"

@@ -1,0 +1,25 @@
+# Makefile integration for tg-ping.
+#
+# Author: Dr. Denys Dutykh (Mathematics Department, Khalifa University of
+#         Science and Technology, Abu Dhabi, UAE).
+#
+# A long build tells you how it went, and a failing one brings its log along.
+
+NOTIFY := tg-ping
+
+.PHONY: all paper test bench
+
+all: paper test
+
+paper:
+	@$(NOTIFY) --start --title "Compiling the paper"
+	@$(NOTIFY) run --label "typst compile" --on failure -- typst compile main.typ
+	@$(NOTIFY) file main.pdf --ok --caption "Paper rebuilt"
+
+test:
+	@$(NOTIFY) run --label "test suite" --tail 30 -- pytest -q
+
+bench:
+	@$(NOTIFY) run --notify-start --label "benchmarks" --limit 7200 -- ./bench.sh
+	@$(NOTIFY) table bench/results.csv --title "Benchmark results"
+	@$(NOTIFY) photo bench/timings.png --caption "Scaling with the number of cores"

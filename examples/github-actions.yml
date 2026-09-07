@@ -1,0 +1,36 @@
+# GitHub Actions integration for tg-ping.
+#
+# Author: Dr. Denys Dutykh (Mathematics Department, Khalifa University of
+#         Science and Technology, Abu Dhabi, UAE).
+#
+# Store TG_PING_TOKEN and TG_PING_CHAT_ID as repository secrets first.
+
+name: build
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make
+
+      - name: Notify Telegram
+        if: always()
+        env:
+          TG_PING_TOKEN: ${{ secrets.TG_PING_TOKEN }}
+          TG_PING_CHAT_ID: ${{ secrets.TG_PING_CHAT_ID }}
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/dutykh/tg-ping/main/bin/tg-ping \
+               -o "$RUNNER_TEMP/tg-ping"
+          chmod +x "$RUNNER_TEMP/tg-ping"
+          "$RUNNER_TEMP/tg-ping" --soft-fail \
+              --level "${{ job.status == 'success' && 'ok' || 'error' }}" \
+              --title "${{ github.workflow }}: ${{ job.status }}" \
+              --field "repo=${{ github.repository }}" \
+              --field "branch=${{ github.ref_name }}" \
+              --field "commit=${{ github.sha }}" \
+              --button "Open the run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

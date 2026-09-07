@@ -1,0 +1,3118 @@
+#!/usr/bin/env bash
+#
+# tg-ping: expressive Telegram notifications for coding and research agents.
+#
+# Author: Dr. Denys Dutykh (Mathematics Department, Khalifa University of
+#         Science and Technology, Abu Dhabi, UAE).
+#
+# Homepage:  https://github.com/dutykh/tg-ping
+# License:   LGPL-2.1-or-later, see the LICENSE file of the distribution.
+#
+# Dependencies: bash (3.2+) and curl. Optional: jq (or python3) for the
+# commands that read incoming updates, and typst or LaTeX for rendered
+# mathematics.
+
+set -uo pipefail
+
+TG_PING_VERSION="1.0.0"
+TG_PING_NAME="tg-ping"
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+readonly TG_MAX_TEXT=4096       # Telegram limit for a text message
+readonly TG_MAX_CAPTION=1024    # Telegram limit for a media caption
+readonly TG_UPLOAD_LIMIT=52428800  # 50 MiB, the bot upload ceiling
+
+# Exit codes, documented in --help and in the README.
+readonly EX_OK=0          # message delivered
+readonly EX_FAIL=1        # generic failure
+readonly EX_USAGE=2       # bad invocation
+readonly EX_CONFIG=3      # missing or invalid credentials
+readonly EX_NET=4         # network unreachable, curl failed
+readonly EX_API=5         # Telegram rejected the request
+readonly EX_RATE=6        # rate limited beyond the retry budget
+readonly EX_TIMEOUT=7     # no answer within the deadline (ask, poll)
+
+# ---------------------------------------------------------------------------
+# Global state, all assigned before use so that "set -u" stays meaningful
+# ---------------------------------------------------------------------------
+
+TOKEN=""
+CHATS=""                  # comma separated list, resolved late
+PROFILE="${TG_PING_PROFILE:-default}"
+API_ROOT="${TG_PING_API:-https://api.telegram.org}"
+ENV_FILE="${TG_PING_ENV_FILE:-}"
+CONFIG_SOURCES=""
+
+VERBOSE=0
+QUIET=0
+DRY_RUN=0
+JSON_OUT=0
+SOFT_FAIL=${TG_PING_SOFT_FAIL:-0}
+DISABLED=${TG_PING_DISABLED:-0}
+TIMEOUT="${TG_PING_TIMEOUT:-20}"
+RETRIES="${TG_PING_RETRIES:-3}"
+FALLBACK=1
+INSECURE=0
+
+# Response of the last API call.
+API_HTTP=""
+API_BODY=""
+API_ERROR=""
+
+WORKDIR=""
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+redact() {
+    # Replace anything that looks like a bot token with a marker, so that no
+    # verbose output, error message or dry run ever leaks the credential.
+    sed -e 's#bot[0-9][0-9]*:[A-Za-z0-9_-]*#bot<TOKEN>#g' \
+        -e 's#[0-9]\{5,\}:[A-Za-z0-9_-]\{20,\}#<TOKEN>#g'
+}
+
+msg()  { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*" >&2; }
+warn() { printf '%s: warning: %s\n' "$TG_PING_NAME" "$*" | redact >&2; }
+note() { [ "$VERBOSE" -eq 1 ] && printf '%s: %s\n' "$TG_PING_NAME" "$*" | redact >&2; return 0; }
+
+die() {
+    local code="$1"; shift
+    printf '%s: error: %s\n' "$TG_PING_NAME" "$*" | redact >&2
+    if [ "$SOFT_FAIL" = "1" ] && [ "$code" != "$EX_USAGE" ]; then
+        note "soft-fail is on, exiting 0 despite the error above"
+        exit "$EX_OK"
+    fi
+    exit "$code"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# ---------------------------------------------------------------------------
+# Temporary working directory, removed on exit
+# ---------------------------------------------------------------------------
+
+_cleanup() {
+    local code=$?
+    [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ] && rm -rf "$WORKDIR"
+    exit "$code"
+}
+
+workdir_init() {
+    # Must run in the main shell: a directory created inside a command
+    # substitution would be removed when that subshell exits.
+    [ -n "$WORKDIR" ] && return 0
+    WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/tg-ping.XXXXXX") ||
+        die "$EX_FAIL" "cannot create a temporary directory"
+    trap _cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    return 0
+}
+
+workdir() {
+    [ -n "$WORKDIR" ] || workdir_init
+    printf '%s' "$WORKDIR"
+}
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+human_duration() {
+    # Seconds to a compact human string: 45s, 3m 12s, 1h 04m 09s.
+    local s="$1" h m
+    h=$(( s / 3600 )); m=$(( (s % 3600) / 60 )); s=$(( s % 60 ))
+    if   [ "$h" -gt 0 ]; then printf '%dh %02dm %02ds' "$h" "$m" "$s"
+    elif [ "$m" -gt 0 ]; then printf '%dm %02ds' "$m" "$s"
+    else                      printf '%ds' "$s"
+    fi
+}
+
+short_hash() {
+    # A stable short digest of stdin, used for cooldown keys.
+    if have sha256sum;   then sha256sum   | cut -c1-16
+    elif have shasum;    then shasum -a 256 | cut -c1-16
+    elif have md5sum;    then md5sum      | cut -c1-16
+    elif have cksum;     then cksum       | tr -d ' ' | cut -c1-16
+    else                      wc -c | tr -d ' '
+    fi
+}
+
+state_dir() {
+    local d="${TG_PING_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tg-ping}"
+    [ -d "$d" ] || mkdir -p "$d" 2>/dev/null || true
+    printf '%s' "$d"
+}
+
+config_dir() {
+    printf '%s' "${TG_PING_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/tg-ping}"
+}
+
+host_name() { printf '%s' "${HOSTNAME:-$(uname -n 2>/dev/null || echo host)}"; }
+
+git_context() {
+    # "repo@branch" when the working directory sits inside a git repository.
+    local root branch
+    have git || return 0
+    root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+    [ -n "$root" ] || return 0
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+    printf '%s@%s' "$(basename "$root")" "$branch"
+}
+
+is_number() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+# ---------------------------------------------------------------------------
+# Configuration
+#
+# Resolution order, first value wins for each setting:
+#   1. command line flags
+#   2. environment variables
+#   3. --env-file FILE, or $TG_PING_ENV_FILE
+#   4. ./.tg-ping.env               (project local, read in full)
+#   5. ./.env                       (only TG_PING_* and TELEGRAM_* keys)
+#   6. $XDG_CONFIG_HOME/tg-ping/<profile>.env
+#   7. /etc/tg-ping/config
+#
+# Files are never sourced and never evaluated: a hand written reader accepts
+# KEY=VALUE lines only, so a hostile .env cannot execute anything.
+# ---------------------------------------------------------------------------
+
+env_file_get() {
+    # env_file_get FILE KEY -> value on stdout, empty when absent.
+    local file="$1" key="$2" line value
+    [ -r "$file" ] || return 1
+    line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$file" 2>/dev/null | tail -n1) || true
+    [ -n "$line" ] || return 1
+    value=${line#*=}
+    # Strip surrounding blanks, then a single layer of matching quotes.
+    value=$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    case "$value" in
+        \"*\") value=${value#\"}; value=${value%\"} ;;
+        \'*\') value=${value#\'}; value=${value%\'} ;;
+        *)     value=$(printf '%s' "$value" | sed -e 's/[[:space:]]*#.*$//' -e 's/[[:space:]]*$//') ;;
+    esac
+    printf '%s' "$value"
+}
+
+config_files() {
+    # Candidate configuration files, most specific first.
+    local dir; dir=$(config_dir)
+    [ -n "$ENV_FILE" ] && printf '%s\n' "$ENV_FILE"
+    if [ "${TG_PING_NO_DOTENV:-0}" != "1" ]; then
+        printf '%s\n' "./.tg-ping.env" "./.env"
+    fi
+    printf '%s\n' "$dir/${PROFILE}.env" "$dir/config.env" "$dir/config" "/etc/tg-ping/config"
+}
+
+lookup_setting() {
+    # lookup_setting PRIMARY [ALIAS...] -> first value found across the files.
+    local file key value
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        [ -r "$file" ] || continue
+        for key in "$@"; do
+            # A generic ./.env may hold unrelated secrets, so only the
+            # namespaced keys are honoured there.
+            if [ "$file" = "./.env" ]; then
+                case "$key" in TG_PING_*|TELEGRAM_*) ;; *) continue ;; esac
+            fi
+            value=$(env_file_get "$file" "$key") || continue
+            if [ -n "$value" ]; then
+                CONFIG_SOURCES="${CONFIG_SOURCES}${file} "
+                printf '%s' "$value"
+                return 0
+            fi
+        done
+    done <<EOF
+$(config_files)
+EOF
+    return 1
+}
+
+load_config() {
+    # Flags already stored in TOKEN and CHATS take precedence over everything.
+    if [ -z "$TOKEN" ]; then
+        TOKEN="${TG_PING_TOKEN:-${TG_PING_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN:-${TELEGRAM_TOKEN:-}}}}"
+    fi
+    if [ -z "$TOKEN" ]; then
+        TOKEN=$(lookup_setting TG_PING_TOKEN TG_PING_BOT_TOKEN TELEGRAM_BOT_TOKEN TELEGRAM_TOKEN BOT_TOKEN) || TOKEN=""
+    fi
+    if [ -z "$CHATS" ]; then
+        CHATS="${TG_PING_CHAT_ID:-${TELEGRAM_CHAT_ID:-${TG_PING_CHAT:-}}}"
+    fi
+    if [ -z "$CHATS" ]; then
+        CHATS=$(lookup_setting TG_PING_CHAT_ID TELEGRAM_CHAT_ID TG_PING_CHAT CHAT_ID) || CHATS=""
+    fi
+    if [ -z "${THREAD_ID:-}" ]; then
+        THREAD_ID="${TG_PING_THREAD_ID:-}"
+        [ -n "$THREAD_ID" ] || THREAD_ID=$(lookup_setting TG_PING_THREAD_ID TG_PING_TOPIC_ID) || THREAD_ID=""
+    fi
+    if [ -z "${PREFIX:-}" ]; then
+        PREFIX="${TG_PING_PREFIX:-}"
+        [ -n "$PREFIX" ] || PREFIX=$(lookup_setting TG_PING_PREFIX) || PREFIX=""
+    fi
+    [ -n "${TG_PING_API:-}" ] || {
+        local api; api=$(lookup_setting TG_PING_API) && [ -n "$api" ] && API_ROOT="$api"
+    }
+    return 0
+}
+
+require_credentials() {
+    load_config
+    if [ -z "$TOKEN" ]; then
+        die "$EX_CONFIG" "no bot token found.
+  Set TG_PING_TOKEN, or run '$TG_PING_NAME init' to create a configuration file.
+  See '$TG_PING_NAME doctor' for the exact locations that were searched."
+    fi
+    if [ -z "$CHATS" ]; then
+        die "$EX_CONFIG" "no chat id found.
+  Set TG_PING_CHAT_ID, pass --chat ID, or run '$TG_PING_NAME init'.
+  '$TG_PING_NAME chats' lists every chat the bot has already seen."
+    fi
+    case "$TOKEN" in
+        *:*) ;;
+        *) warn "the token does not look like a Telegram bot token (expected digits, a colon, then the secret)" ;;
+    esac
+    local chat
+    for chat in $(chat_list); do
+        case "$chat" in
+            -[0-9]*|[0-9]*) is_number "${chat#-}" || chat_id_invalid "$chat" ;;
+            @[A-Za-z0-9_]*) ;;
+            *) chat_id_invalid "$chat" ;;
+        esac
+    done
+}
+
+chat_id_invalid() {
+    die "$EX_CONFIG" "'$1' is not a usable chat id.
+  A chat id is a number such as 123456789 or -1001234567890, or a public
+  channel name such as @my_channel. Run '$TG_PING_NAME chats' to see the ids
+  the bot already knows, or '$TG_PING_NAME init' to configure one."
+}
+
+chat_list() {
+    # Split the comma or space separated chat list into one id per line.
+    # shellcheck disable=SC2020  # both separators are meant to become newlines
+    printf '%s' "$CHATS" | tr ',;' '\n\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$'
+}
+
+# ---------------------------------------------------------------------------
+# Escaping helpers
+# ---------------------------------------------------------------------------
+
+html_escape() {
+    # Telegram HTML parse mode needs exactly these three replaced.
+    sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+html_unescape() {
+    sed -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&quot;/"/g' -e 's/&amp;/\&/g'
+}
+
+html_strip() {
+    # Turn a rendered HTML message back into readable plain text. Used by the
+    # automatic fallback when Telegram refuses to parse the markup.
+    sed -e 's#<br */*>#\n#g' -e 's/<[^>]*>//g' | html_unescape
+}
+
+md2_escape() {
+    # Escape every character that MarkdownV2 treats as special.
+    sed -e 's/\\/\\\\/g' -e 's/[][_*()~`>#+=|{}.!-]/\\&/g'
+}
+
+json_escape() {
+    # Escape stdin for embedding inside a JSON string literal.
+    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' -e 's/\r/\\r/g' |
+        awk 'BEGIN{ORS=""} {if (NR>1) print "\\n"; print}'
+}
+
+curl_conf_escape() {
+    # Escape stdin for a double quoted value inside a curl configuration file.
+    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' |
+        awk 'BEGIN{ORS=""} {if (NR>1) print "\\n"; print}'
+}
+
+# ---------------------------------------------------------------------------
+# Reading JSON replies. jq is used when available, python3 next, and a small
+# text extractor last so that the common paths work with curl alone.
+# ---------------------------------------------------------------------------
+
+json_get() {
+    # json_get JSON DOTTED.PATH -> scalar value, empty when absent.
+    local json="$1" path="$2"
+    if have jq; then
+        printf '%s' "$json" | jq -r --arg p "$path" '
+            def pick($p): reduce ($p | split(".")[]) as $k (.; if type=="object" then .[$k] else null end);
+            pick($p) | if . == null then "" else tostring end' 2>/dev/null
+        return 0
+    fi
+    if have python3; then
+        TGP_JSON="$json" TGP_PATH="$path" python3 -c '
+import json, os, sys
+try:
+    data = json.loads(os.environ["TGP_JSON"])
+except Exception:
+    sys.exit(0)
+for key in os.environ["TGP_PATH"].split("."):
+    if isinstance(data, dict) and key in data:
+        data = data[key]
+    else:
+        sys.exit(0)
+if isinstance(data, bool):
+    sys.stdout.write("true" if data else "false")
+elif data is not None:
+    sys.stdout.write(str(data))
+' 2>/dev/null
+        return 0
+    fi
+    # Last resort: match the final path element as a flat key.
+    local key="${path##*.}"
+    printf '%s' "$json" |
+        sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p;
+                s/.*\"${key}\"[[:space:]]*:[[:space:]]*\([-0-9][0-9]*\).*/\1/p;
+                s/.*\"${key}\"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p" |
+        head -n1
+}
+
+need_json_reader() {
+    have jq && return 0
+    have python3 && return 0
+    die "$EX_CONFIG" "'$1' reads incoming Telegram updates and needs jq or python3.
+  Install one of them, for example:  sudo apt install -y jq"
+}
+
+# ---------------------------------------------------------------------------
+# Transport
+#
+# Every request is handed to curl through a configuration file on stdin
+# (curl --config -). The bot token therefore never appears in the process
+# table, and field values are read from files, which removes all shell
+# quoting concerns for arbitrary message text.
+# ---------------------------------------------------------------------------
+
+REQ_FIELDS=()
+REQ_FILES=()
+
+req_reset() { REQ_FIELDS=(); REQ_FILES=(); }
+
+req_add() {
+    # req_add NAME VALUE, skipped silently when the value is empty.
+    [ -n "${2:-}" ] || return 0
+    REQ_FIELDS[${#REQ_FIELDS[@]}]="$1=$2"
+}
+
+req_add_always() { REQ_FIELDS[${#REQ_FIELDS[@]}]="$1=${2:-}"; }
+
+req_file() {
+    # req_file NAME PATH, attached as a multipart upload.
+    REQ_FILES[${#REQ_FILES[@]}]="$1=$2"
+}
+
+_write_value() {
+    # Store a field value in the working directory and echo the file path.
+    # The file is named after the field, because a counter incremented inside
+    # a command substitution would not survive the subshell.
+    local name="$1" wd f
+    wd=$(workdir)
+    f="$wd/field.$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_')"
+    printf '%s' "$2" > "$f"
+    chmod 600 "$f" 2>/dev/null || true
+    printf '%s' "$f"
+}
+
+_build_config() {
+    # Emit a curl configuration file for METHOD on stdout.
+    local method="$1" wd multipart=0 entry name value vfile
+    wd=$(workdir)
+    [ ${#REQ_FILES[@]} -gt 0 ] && multipart=1
+
+    printf 'url = "%s/bot%s/%s"\n' "$API_ROOT" "$TOKEN" "$method"
+    printf 'silent\nshow-error\nlocation\n'
+    printf 'max-time = %s\n' "$TIMEOUT"
+    printf 'user-agent = "%s/%s"\n' "$TG_PING_NAME" "$TG_PING_VERSION"
+    [ "$INSECURE" -eq 1 ] && printf 'insecure\n'
+
+    for entry in ${REQ_FIELDS[@]+"${REQ_FIELDS[@]}"}; do
+        name=${entry%%=*}
+        value=${entry#*=}
+        vfile=$(_write_value "$name" "$value")
+        if [ "$multipart" -eq 1 ]; then
+            printf 'form = "%s=<%s"\n' "$name" "$(printf '%s' "$vfile" | curl_conf_escape)"
+        else
+            printf 'data-urlencode = "%s@%s"\n' "$name" "$(printf '%s' "$vfile" | curl_conf_escape)"
+        fi
+    done
+
+    for entry in ${REQ_FILES[@]+"${REQ_FILES[@]}"}; do
+        name=${entry%%=*}
+        value=${entry#*=}
+        printf 'form = "%s=@%s"\n' "$name" "$(printf '%s' "$value" | curl_conf_escape)"
+    done
+
+    printf 'output = "%s"\n' "$wd/response.json"
+    printf 'write-out = "%%{http_code}"\n'
+}
+
+_safe_path() {
+    # curl's -F parser treats ; and , specially, and @ or < at the start of a
+    # value have their own meaning. Copy such files under a tame name.
+    local path="$1" wd base
+    case "$path" in
+        *[\;\,\"]*|*$'\n'*)
+            wd=$(workdir)
+            base=$(basename "$path" | tr -c 'A-Za-z0-9._-' '_')
+            cp "$path" "$wd/$base" || die "$EX_FAIL" "cannot read $path"
+            printf '%s' "$wd/$base"
+            ;;
+        *) printf '%s' "$path" ;;
+    esac
+}
+
+dry_run_dump() {
+    local method="$1" entry name value
+    printf '%s\n' "--- $TG_PING_NAME dry run ---"
+    printf 'endpoint : %s/bot<TOKEN>/%s\n' "$API_ROOT" "$method"
+    for entry in ${REQ_FIELDS[@]+"${REQ_FIELDS[@]}"}; do
+        name=${entry%%=*}; value=${entry#*=}
+        printf 'field    : %s = %s\n' "$name" "$value" | redact
+    done
+    for entry in ${REQ_FILES[@]+"${REQ_FILES[@]}"}; do
+        name=${entry%%=*}; value=${entry#*=}
+        printf 'upload   : %s = %s\n' "$name" "$value"
+    done
+    printf '%s\n' "--- end of dry run ---"
+}
+
+api_call() {
+    # api_call METHOD. Sets API_HTTP, API_BODY and API_ERROR.
+    # Returns 0 when Telegram answered ok:true, otherwise an EX_* code.
+    local method="$1" attempt=0 rc delay retry_after wd cfg
+    API_HTTP=""; API_BODY=""; API_ERROR=""
+
+    if [ "$DISABLED" = "1" ]; then
+        note "TG_PING_DISABLED is set, skipping the $method call"
+        API_BODY='{"ok":true,"result":{"message_id":0},"disabled":true}'
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        dry_run_dump "$method" >&2
+        API_BODY='{"ok":true,"result":{"message_id":0},"dry_run":true}'
+        return 0
+    fi
+
+    have curl || die "$EX_CONFIG" "curl is required but was not found (sudo apt install -y curl)"
+
+    wd=$(workdir); cfg="$wd/curl.cfg"
+    while :; do
+        attempt=$(( attempt + 1 ))
+        _build_config "$method" > "$cfg"
+        chmod 600 "$cfg" 2>/dev/null || true
+        rm -f "$wd/response.json"
+
+        API_HTTP=$(curl --config "$cfg" 2>"$wd/curl.err")
+        rc=$?
+        [ -f "$wd/response.json" ] && API_BODY=$(cat "$wd/response.json") || API_BODY=""
+
+        if [ "$rc" -ne 0 ] && [ -z "$API_BODY" ]; then
+            API_ERROR="curl failed with exit code $rc: $(tr -d '\n' < "$wd/curl.err" | redact)"
+            if [ "$attempt" -le "$RETRIES" ]; then
+                delay=$(( attempt * attempt ))
+                note "$API_ERROR, retrying in ${delay}s (attempt $attempt of $RETRIES)"
+                sleep "$delay"; continue
+            fi
+            return "$EX_NET"
+        fi
+
+        case "$API_HTTP" in
+            2*)
+                if [ "$(json_get "$API_BODY" "ok")" = "true" ]; then
+                    note "$method succeeded (HTTP $API_HTTP)"
+                    return 0
+                fi
+                API_ERROR=$(json_get "$API_BODY" "description")
+                [ -n "$API_ERROR" ] || API_ERROR="unexpected reply: $API_BODY"
+                return "$EX_API"
+                ;;
+            429)
+                retry_after=$(json_get "$API_BODY" "parameters.retry_after")
+                is_number "$retry_after" || retry_after=$(( attempt * 5 ))
+                API_ERROR="rate limited by Telegram, retry_after=${retry_after}s"
+                if [ "$attempt" -le "$RETRIES" ]; then
+                    note "$API_ERROR, waiting (attempt $attempt of $RETRIES)"
+                    sleep "$retry_after"; continue
+                fi
+                return "$EX_RATE"
+                ;;
+            5*)
+                API_ERROR="Telegram server error (HTTP $API_HTTP)"
+                if [ "$attempt" -le "$RETRIES" ]; then
+                    delay=$(( attempt * attempt ))
+                    note "$API_ERROR, retrying in ${delay}s"
+                    sleep "$delay"; continue
+                fi
+                return "$EX_API"
+                ;;
+            *)
+                API_ERROR=$(json_get "$API_BODY" "description")
+                [ -n "$API_ERROR" ] || API_ERROR="HTTP $API_HTTP"
+                return "$EX_API"
+                ;;
+        esac
+    done
+}
+
+api_explain() {
+    # Turn the raw Telegram complaint into advice the caller can act on.
+    local err="$1"
+    case "$err" in
+        *"chat not found"*)
+            printf '%s\n' "$err
+  The bot cannot reach that chat id. Open Telegram, send /start to your bot,
+  then run '$TG_PING_NAME chats' to read the correct id. For a channel the bot
+  must be an administrator, and the id looks like -1001234567890." ;;
+        *"bot was blocked"*)
+            printf '%s\n' "$err
+  Unblock the bot in Telegram and send it /start again." ;;
+        *"Unauthorized"*|*"unauthorized"*)
+            printf '%s\n' "$err
+  The bot token is wrong or was revoked. Ask @BotFather for the current token." ;;
+        *"can't parse entities"*|*"can't find end"*)
+            printf '%s\n' "$err
+  The markup was rejected. Use --format plain, or let the automatic plain text
+  fallback handle it (it is on unless --no-fallback is given)." ;;
+        *"message thread not found"*)
+            printf '%s\n' "$err
+  The --topic id does not exist in that group, or the group has no topics." ;;
+        *) printf '%s\n' "$err" ;;
+    esac
+}
+
+report_result() {
+    # Common success reporting for the sending commands.
+    local chat="$1" mid
+    if [ "$JSON_OUT" -eq 1 ]; then
+        printf '%s\n' "$API_BODY"
+    elif [ "$VERBOSE" -eq 1 ]; then
+        mid=$(json_get "$API_BODY" "result.message_id")
+        msg "sent to chat $chat (message $mid)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Formatting
+#
+# The default format is "auto": the caller writes light Markdown, the tool
+# emits correctly escaped Telegram HTML, and if Telegram still refuses the
+# markup the message is resent as literal plain text. A notification is never
+# lost because an agent happened to write an underscore.
+# ---------------------------------------------------------------------------
+
+level_emoji() {
+    case "$(lc "${1:-}")" in
+        start|begin|run)      printf '\xf0\x9f\x9a\x80' ;;   # rocket
+        info|note)            printf '\xe2\x84\xb9\xef\xb8\x8f' ;;
+        ok|success|done)      printf '\xe2\x9c\x85' ;;
+        warn|warning)         printf '\xe2\x9a\xa0\xef\xb8\x8f' ;;
+        err|error|fail)       printf '\xe2\x9d\x8c' ;;
+        question|ask)         printf '\xe2\x9d\x93' ;;
+        debug|trace)          printf '\xf0\x9f\x90\x9b' ;;
+        progress|working)     printf '\xe2\x8f\xb3' ;;
+        math|result)          printf '\xf0\x9f\x93\x90' ;;
+        *)                    printf '' ;;
+    esac
+}
+
+md_to_html() {
+    # Convert light Markdown on stdin into Telegram HTML on stdout.
+    awk '
+    function esc(s) {
+        gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s); gsub(/>/, "\\&gt;", s)
+        return s
+    }
+    # Fragments already rendered to HTML are parked behind a placeholder so
+    # that later inline rules cannot corrupt them (a URL full of underscores,
+    # or Markdown characters inside a code span).
+    function store(html) {
+        nfrag++; frag[nfrag] = html
+        return SOH nfrag STX
+    }
+    function restore(s,    p, q, id) {
+        while ((p = index(s, SOH)) > 0) {
+            q = index(substr(s, p), STX)
+            if (q == 0) break
+            id = substr(s, p + 1, q - 2) + 0
+            s = substr(s, 1, p - 1) frag[id] substr(s, p + q)
+        }
+        return s
+    }
+    function wrap(s, re, o, c, dlen, guard,    out, pre, m, body, prevch, nextch, ok) {
+        out = ""
+        while (match(s, re)) {
+            pre = substr(s, 1, RSTART - 1)
+            m   = substr(s, RSTART, RLENGTH)
+            if (RSTART > 1)           prevch = substr(s, RSTART - 1, 1)
+            else if (length(out) > 0) prevch = substr(out, length(out), 1)
+            else                      prevch = ""
+            nextch = substr(s, RSTART + RLENGTH, 1)
+            ok = 1
+            if (guard) {
+                if (prevch ~ /[A-Za-z0-9]/) ok = 0
+                if (nextch ~ /[A-Za-z0-9]/) ok = 0
+            }
+            body = substr(m, dlen + 1, RLENGTH - 2 * dlen)
+            out = out pre (ok ? store(o body c) : m)
+            s = substr(s, RSTART + RLENGTH)
+        }
+        return out s
+    }
+    function links(s,    out, m, pre, lab, url, p) {
+        out = ""
+        while (match(s, "\\[[^]\\[]*\\]\\([^)]*\\)")) {
+            pre = substr(s, 1, RSTART - 1)
+            m   = substr(s, RSTART, RLENGTH)
+            p   = index(m, "](")
+            lab = substr(m, 2, p - 2)
+            url = substr(m, p + 2, length(m) - p - 2)
+            gsub(/"/, "\\&quot;", url)
+            out = out pre store("<a href=\"" url "\">" lab "</a>")
+            s = substr(s, RSTART + RLENGTH)
+        }
+        return out s
+    }
+    function inline(s) {
+        # Code spans first: whatever sits inside them stays literal.
+        while (match(s, "`[^`]+`"))
+            s = substr(s, 1, RSTART - 1) \
+                store("<code>" substr(s, RSTART + 1, RLENGTH - 2) "</code>") \
+                substr(s, RSTART + RLENGTH)
+        s = links(s)
+        s = wrap(s, "\\*\\*[^*]+\\*\\*",   "<b>", "</b>", 2, 0)
+        s = wrap(s, "__[^_]+__",           "<u>", "</u>", 2, 1)
+        s = wrap(s, "~~[^~]+~~",           "<s>", "</s>", 2, 0)
+        s = wrap(s, "\\|\\|[^|]+\\|\\|",   "<tg-spoiler>", "</tg-spoiler>", 2, 0)
+        s = wrap(s, "\\*[^* ][^*]*\\*",    "<b>", "</b>", 1, 1)
+        s = wrap(s, "_[^_ ][^_]*_",        "<i>", "</i>", 1, 1)
+        return restore(s)
+    }
+    BEGIN {
+        SOH = sprintf("%c", 1); STX = sprintf("%c", 2)
+        nfrag = 0; incode = 0; inquote = 0; nolang = 0
+    }
+    {
+        line = $0
+        if (line ~ /^[[:space:]]*```/) {
+            if (incode) { print (nolang ? "</pre>" : "</code></pre>"); incode = 0 }
+            else {
+                lang = line
+                sub(/^[[:space:]]*```[[:space:]]*/, "", lang)
+                gsub(/[^A-Za-z0-9+#._-]/, "", lang)
+                nolang = (lang == "")
+                if (nolang) printf "<pre>"
+                else        printf "<pre><code class=\"language-%s\">", lang
+                incode = 1
+            }
+            next
+        }
+        if (incode) { print esc(line); next }
+
+        if (line ~ /^[[:space:]]*>[[:space:]]?/) {
+            if (!inquote) { printf "<blockquote>"; inquote = 1 }
+            sub(/^[[:space:]]*>[[:space:]]?/, "", line)
+            print inline(esc(line))
+            next
+        } else if (inquote) { print "</blockquote>"; inquote = 0 }
+
+        if (line ~ /^[[:space:]]*#{1,6}[[:space:]]+/) {
+            sub(/^[[:space:]]*#{1,6}[[:space:]]+/, "", line)
+            print "<b>" inline(esc(line)) "</b>"
+            next
+        }
+        if (line ~ /^[[:space:]]*[-*+][[:space:]]+/) {
+            indent = line
+            sub(/[^ \t].*$/, "", indent)
+            sub(/^[[:space:]]*[-*+][[:space:]]+/, "", line)
+            print indent "\342\200\242 " inline(esc(line))
+            next
+        }
+        print inline(esc(line))
+    }
+    END {
+        if (incode)  print (nolang ? "</pre>" : "</code></pre>")
+        if (inquote) print "</blockquote>"
+    }
+    '
+}
+
+format_text() {
+    # format_text TEXT -> markup in the active format.
+    local text="$1"
+    case "$FORMAT" in
+        auto)     printf '%s' "$text" | md_to_html ;;
+        html)     printf '%s' "$text" ;;
+        markdown) printf '%s' "$text" ;;
+        *)        printf '%s' "$text" ;;
+    esac
+}
+
+fmt_escape() {
+    # Escape a literal fragment (a title, a field name) for the active format.
+    case "$FORMAT" in
+        auto|html) printf '%s' "$1" | html_escape ;;
+        markdown)  printf '%s' "$1" | md2_escape ;;
+        *)         printf '%s' "$1" ;;
+    esac
+}
+
+fmt_bold() {
+    case "$FORMAT" in
+        auto|html) printf '<b>%s</b>' "$(fmt_escape "$1")" ;;
+        markdown)  printf '*%s*' "$(fmt_escape "$1")" ;;
+        *)         printf '%s' "$1" ;;
+    esac
+}
+
+fmt_italic() {
+    case "$FORMAT" in
+        auto|html) printf '<i>%s</i>' "$(fmt_escape "$1")" ;;
+        markdown)  printf '_%s_' "$(fmt_escape "$1")" ;;
+        *)         printf '%s' "$1" ;;
+    esac
+}
+
+fmt_code_block() {
+    # fmt_code_block CONTENT [LANGUAGE]
+    local content="$1" lang="${2:-}"
+    case "$FORMAT" in
+        auto|html)
+            if [ -n "$lang" ]; then
+                printf '<pre><code class="language-%s">%s</code></pre>' \
+                    "$(printf '%s' "$lang" | tr -cd 'A-Za-z0-9+#._-')" \
+                    "$(printf '%s' "$content" | html_escape)"
+            else
+                printf '<pre>%s</pre>' "$(printf '%s' "$content" | html_escape)"
+            fi ;;
+        markdown)
+            # shellcheck disable=SC2016  # the backticks are literal Markdown
+            printf '```%s\n%s\n```' "$lang" "$(printf '%s' "$content" | sed -e 's/\\/\\\\/g' -e 's/`/\\`/g')" ;;
+        *)
+            printf '%s' "$content" ;;
+    esac
+}
+
+fmt_quote() {
+    # fmt_quote CONTENT EXPANDABLE
+    local content="$1" expandable="${2:-0}"
+    case "$FORMAT" in
+        auto|html)
+            if [ "$expandable" -eq 1 ]; then
+                printf '<blockquote expandable>%s</blockquote>' "$(printf '%s' "$content" | html_escape)"
+            else
+                printf '<blockquote>%s</blockquote>' "$(printf '%s' "$content" | html_escape)"
+            fi ;;
+        markdown)
+            printf '%s' "$content" | md2_escape | sed -e 's/^/>/' ;;
+        *)
+            printf '%s' "$content" | sed -e 's/^/| /' ;;
+    esac
+}
+
+progress_bar() {
+    # progress_bar PERCENT [WIDTH] -> a filled bar plus the percentage.
+    local pct="$1" width="${2:-12}" filled i out=""
+    is_number "$pct" || pct=0
+    [ "$pct" -gt 100 ] && pct=100
+    filled=$(( pct * width / 100 ))
+    i=0
+    while [ "$i" -lt "$width" ]; do
+        if [ "$i" -lt "$filled" ]; then out="${out}▰"; else out="${out}▱"; fi
+        i=$(( i + 1 ))
+    done
+    printf '%s %s%%' "$out" "$pct"
+}
+
+split_into_files() {
+    # split_into_files TEXT LIMIT DIR PREFIX -> number of parts on stdout.
+    # Splits on line boundaries and keeps <pre> blocks balanced across parts.
+    local text="$1" limit="$2" dir="$3" prefix="$4"
+    printf '%s' "$text" | LC_ALL=C awk -v limit="$limit" -v dir="$dir" -v prefix="$prefix" '
+    function flush(closing,    f) {
+        if (buf == "" && part > 0) return
+        part++
+        f = sprintf("%s/%s.%03d", dir, prefix, part)
+        printf "%s%s", buf, closing > f
+        close(f)
+        buf = ""
+    }
+    BEGIN { part = 0; buf = ""; open_tag = ""; close_tag = "" }
+    {
+        line = $0
+        # Track fenced HTML code blocks so a split never orphans a tag.
+        if (match(line, /<pre><code[^>]*>|<pre>/)) {
+            open_tag  = substr(line, RSTART, RLENGTH)
+            close_tag = (open_tag ~ /<code/) ? "</code></pre>" : "</pre>"
+            if (line ~ /<\/pre>/) { open_tag = ""; close_tag = "" }
+        } else if (line ~ /<\/pre>/) { open_tag = ""; close_tag = "" }
+
+        while (length(line) > limit) {
+            flush(close_tag)
+            buf = open_tag substr(line, 1, limit)
+            line = substr(line, limit + 1)
+            flush(close_tag)
+        }
+        candidate = (buf == "" ? line : buf "\n" line)
+        if (length(candidate) > limit) {
+            flush(close_tag)
+            buf = open_tag line
+        } else {
+            buf = candidate
+        }
+    }
+    END { flush(""); print part }
+    '
+}
+
+# ---------------------------------------------------------------------------
+# Message composition
+# ---------------------------------------------------------------------------
+
+# Composition state, filled in by the argument parser.
+TITLE=""; BODY=""; LEVEL=""; EMOJI=""; META=0
+QUOTE_TEXT=""; COLLAPSE=0; CODE_TEXT=""; CODE_LANG=""; PERCENT=""
+FORMAT="${TG_PING_FORMAT:-auto}"
+SILENT=0; PIN=0; PROTECT=0; REPLY_TO=""; NO_PREVIEW=1
+TRUNCATE=0; MAX_PARTS="${TG_PING_MAX_PARTS:-8}"
+COOLDOWN=""; COOLDOWN_KEY=""; TEE=0
+BUTTON_COLS=1
+ITEMS=(); FIELDS=(); BUTTONS=()
+THREAD_ID="${THREAD_ID:-}"; PREFIX="${PREFIX:-}"
+
+build_message() {
+    local out="" head="" emoji="" item entry key value
+    emoji="$EMOJI"
+    [ -n "$emoji" ] || emoji=$(level_emoji "$LEVEL")
+
+    head=""
+    [ -n "$emoji" ] && head="$emoji "
+    [ -n "$PREFIX" ] && head="${head}$(fmt_escape "$PREFIX") "
+    if [ -n "$TITLE" ]; then
+        head="${head}$(fmt_bold "$TITLE")"
+    elif [ -n "$head" ] && [ -n "$BODY" ]; then
+        : # a bare emoji simply prefixes the body
+    fi
+
+    if [ -n "$TITLE" ]; then
+        out="$head"
+        [ -n "$BODY" ] && out="$out
+$(format_text "$BODY")"
+    elif [ -n "$BODY" ]; then
+        out="${head}$(format_text "$BODY")"
+    else
+        out="$head"
+    fi
+
+    if [ -n "$PERCENT" ]; then
+        out="$out
+$(progress_bar "$PERCENT" "${TG_PING_BAR_WIDTH:-12}")"
+    fi
+
+    for item in ${ITEMS[@]+"${ITEMS[@]}"}; do
+        out="$out
+• $(format_text "$item")"
+    done
+
+    for entry in ${FIELDS[@]+"${FIELDS[@]}"}; do
+        key=${entry%%=*}
+        value=${entry#*=}
+        out="$out
+$(fmt_bold "$key"): $(fmt_escape "$value")"
+    done
+
+    if [ -n "$QUOTE_TEXT" ]; then
+        out="$out
+$(fmt_quote "$QUOTE_TEXT" "$COLLAPSE")"
+    fi
+
+    if [ -n "$CODE_TEXT" ]; then
+        out="$out
+$(fmt_code_block "$CODE_TEXT" "$CODE_LANG")"
+    fi
+
+    if [ "$META" -eq 1 ]; then
+        local ctx meta
+        ctx=$(git_context)
+        meta="$(host_name)"
+        [ -n "$ctx" ] && meta="$meta · $ctx"
+        meta="$meta · $(date '+%Y-%m-%d %H:%M %Z')"
+        out="$out
+
+$(fmt_italic "$meta")"
+    fi
+
+    printf '%s' "$out"
+}
+
+buttons_json() {
+    # Build an inline_keyboard from BUTTONS entries of the form
+    # "url|LABEL|TARGET" or "cb|LABEL|DATA".
+    local entry kind label target row=0 col=0 json="" sep=""
+    [ ${#BUTTONS[@]} -eq 0 ] && return 1
+    json='{"inline_keyboard":['
+    for entry in ${BUTTONS[@]+"${BUTTONS[@]}"}; do
+        kind=${entry%%|*}; entry=${entry#*|}
+        label=${entry%%|*}; target=${entry#*|}
+        if [ "$col" -eq 0 ]; then
+            [ "$row" -gt 0 ] && json="${json}],["
+            [ "$row" -eq 0 ] && json="${json}["
+            row=$(( row + 1 )); sep=""
+        fi
+        if [ "$kind" = "url" ]; then
+            json="$json$sep{\"text\":\"$(printf '%s' "$label" | json_escape)\",\"url\":\"$(printf '%s' "$target" | json_escape)\"}"
+        else
+            json="$json$sep{\"text\":\"$(printf '%s' "$label" | json_escape)\",\"callback_data\":\"$(printf '%s' "$target" | json_escape)\"}"
+        fi
+        sep=","
+        col=$(( col + 1 ))
+        [ "$col" -ge "$BUTTON_COLS" ] && col=0
+    done
+    json="$json]]}"
+    printf '%s' "$json"
+}
+
+parse_mode_value() {
+    case "$FORMAT" in
+        auto|html) printf 'HTML' ;;
+        markdown)  printf 'MarkdownV2' ;;
+        *)         printf '' ;;
+    esac
+}
+
+cooldown_allows() {
+    # Returns 1 when an identical alert was sent inside the cooldown window.
+    local text="$1" key file now last dir
+    [ -n "$COOLDOWN" ] || return 0
+    is_number "$COOLDOWN" || die "$EX_USAGE" "--cooldown expects seconds"
+    key="$COOLDOWN_KEY"
+    [ -n "$key" ] || key=$(printf '%s' "$text" | short_hash)
+    key=$(printf '%s' "$key" | tr -c 'A-Za-z0-9._-' '_')
+    dir=$(state_dir); file="$dir/cooldown.$key"
+    now=$(date +%s)
+    if [ -f "$file" ]; then
+        last=$(cat "$file" 2>/dev/null || echo 0)
+        is_number "$last" || last=0
+        if [ $(( now - last )) -lt "$COOLDOWN" ]; then
+            note "suppressed by --cooldown (${COOLDOWN}s, key $key)"
+            return 1
+        fi
+    fi
+    printf '%s' "$now" > "$file" 2>/dev/null || true
+    return 0
+}
+
+send_one() {
+    # send_one CHAT TEXT [KEYBOARD_JSON]. Handles the plain text fallback.
+    local chat="$1" text="$2" keyboard="${3:-}" mode rc
+    mode=$(parse_mode_value)
+
+    req_reset
+    req_add chat_id "$chat"
+    req_add text "$text"
+    req_add parse_mode "$mode"
+    [ "$NO_PREVIEW" -eq 1 ] && req_add disable_web_page_preview "true"
+    [ "$SILENT" -eq 1 ] && req_add disable_notification "true"
+    [ "$PROTECT" -eq 1 ] && req_add protect_content "true"
+    req_add message_thread_id "$THREAD_ID"
+    req_add reply_to_message_id "$REPLY_TO"
+    req_add reply_markup "$keyboard"
+
+    api_call sendMessage
+    rc=$?
+    if [ "$rc" -eq "$EX_API" ] && [ "$FALLBACK" -eq 1 ]; then
+        case "$API_ERROR" in
+            *"parse entities"*|*"can't find end"*|*"Unsupported start tag"*|*"unsupported start tag"*|*"Unmatched end tag"*|*"TAG"*)
+                warn "Telegram rejected the markup ($API_ERROR), resending as plain text"
+                local plain
+                plain=$(printf '%s' "$text" | html_strip)
+                req_reset
+                req_add chat_id "$chat"
+                req_add text "$plain"
+                [ "$SILENT" -eq 1 ] && req_add disable_notification "true"
+                [ "$PROTECT" -eq 1 ] && req_add protect_content "true"
+                req_add message_thread_id "$THREAD_ID"
+                req_add reply_to_message_id "$REPLY_TO"
+                req_add reply_markup "$keyboard"
+                api_call sendMessage
+                rc=$?
+                ;;
+        esac
+    fi
+    return "$rc"
+}
+
+pin_last() {
+    local chat="$1" mid
+    mid=$(json_get "$API_BODY" "result.message_id")
+    [ -n "$mid" ] && [ "$mid" != "0" ] || return 0
+    local saved_body="$API_BODY"
+    req_reset
+    req_add chat_id "$chat"
+    req_add message_id "$mid"
+    [ "$SILENT" -eq 1 ] && req_add disable_notification "true"
+    api_call pinChatMessage || warn "could not pin the message: $API_ERROR"
+    API_BODY="$saved_body"
+    return 0
+}
+
+deliver() {
+    # deliver TEXT: split when needed, fan out over every configured chat.
+    local text="$1" keyboard chat parts i part file wd limit rc failures=0 sent=0
+    [ -n "$text" ] || die "$EX_USAGE" "nothing to send (give a message, pipe one in, or use --title)"
+    keyboard=$(buttons_json) || keyboard=""
+
+    cooldown_allows "$text" || exit "$EX_OK"
+
+    [ "$TEE" -eq 1 ] && printf '%s\n' "$(printf '%s' "$text" | html_strip)"
+
+    limit=$(( TG_MAX_TEXT - 200 ))
+    wd=$(workdir)
+    rm -f "$wd"/part.* 2>/dev/null || true
+    parts=$(split_into_files "$text" "$limit" "$wd" "part")
+    is_number "$parts" || parts=1
+
+    if [ "$parts" -gt "$MAX_PARTS" ]; then
+        warn "message needs $parts parts, keeping the first $MAX_PARTS (use --max-parts or --truncate)"
+        parts="$MAX_PARTS"
+    fi
+    if [ "$TRUNCATE" -eq 1 ] && [ "$parts" -gt 1 ]; then
+        parts=1
+    fi
+
+    for chat in $(chat_list); do
+        i=0
+        while [ "$i" -lt "$parts" ]; do
+            i=$(( i + 1 ))
+            file=$(printf '%s/part.%03d' "$wd" "$i")
+            [ -f "$file" ] || break
+            part=$(cat "$file")
+            if [ "$parts" -gt 1 ]; then
+                part="$part
+$(fmt_italic "part $i of $parts")"
+            fi
+            # Buttons ride on the last part only.
+            if [ "$i" -eq "$parts" ]; then
+                send_one "$chat" "$part" "$keyboard"; rc=$?
+            else
+                send_one "$chat" "$part" ""; rc=$?
+            fi
+            if [ "$rc" -ne 0 ]; then
+                failures=$(( failures + 1 ))
+                printf '%s: error: chat %s: %s\n' "$TG_PING_NAME" "$chat" "$(api_explain "$API_ERROR")" | redact >&2
+                break
+            fi
+            sent=$(( sent + 1 ))
+        done
+        [ "$PIN" -eq 1 ] && pin_last "$chat"
+        [ "$failures" -eq 0 ] && report_result "$chat"
+    done
+
+    if [ "$failures" -gt 0 ]; then
+        [ "$SOFT_FAIL" = "1" ] && { note "soft-fail is on, reporting success"; return 0; }
+        return "$EX_API"
+    fi
+    [ "$sent" -eq 0 ] && return "$EX_FAIL"
+    return 0
+}
+
+read_stdin_if_piped() {
+    # Body from stdin when nothing was given on the command line and the
+    # tool sits at the end of a pipe.
+    if [ -z "$BODY" ] && [ ! -t 0 ]; then
+        BODY=$(cat)
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Media
+# ---------------------------------------------------------------------------
+
+file_size() { wc -c < "$1" 2>/dev/null | tr -d ' '; }
+
+guess_kind() {
+    # Map an extension to the Telegram send method family.
+    case "$(lc "${1##*.}")" in
+        jpg|jpeg|png|webp)           printf 'photo' ;;
+        gif)                         printf 'animation' ;;
+        mp4|mov|m4v|mkv|webm)        printf 'video' ;;
+        mp3|m4a|flac|wav|oga|ogg)    printf 'audio' ;;
+        *)                           printf 'document' ;;
+    esac
+}
+
+is_remote_ref() {
+    case "$1" in
+        http://*|https://*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+check_upload() {
+    local path="$1" size
+    [ -f "$path" ] || die "$EX_USAGE" "no such file: $path"
+    [ -r "$path" ] || die "$EX_USAGE" "cannot read: $path"
+    size=$(file_size "$path")
+    if is_number "$size" && [ "$size" -gt "$TG_UPLOAD_LIMIT" ]; then
+        die "$EX_USAGE" "$path is $(( size / 1048576 )) MiB, above the 50 MiB bot upload limit.
+  Split it, compress it, or upload it elsewhere and send the link instead."
+    fi
+    if is_number "$size" && [ "$size" -eq 0 ]; then
+        die "$EX_USAGE" "$path is empty"
+    fi
+}
+
+caption_split() {
+    # Sets CAPTION_TEXT and CAPTION_OVERFLOW. It must not be called through a
+    # command substitution, or the assignments would stay in the subshell.
+    local text="$1"
+    CAPTION_TEXT="$text"
+    CAPTION_OVERFLOW=""
+    if [ "$(printf '%s' "$text" | wc -c | tr -d ' ')" -gt "$TG_MAX_CAPTION" ]; then
+        CAPTION_TEXT=$(printf '%s' "$text" | head -c 400)
+        CAPTION_OVERFLOW="$text"
+    fi
+}
+
+send_media_file() {
+    # send_media_file METHOD FIELD PATH CAPTION [DISPLAY_NAME]
+    local method="$1" field="$2" path="$3" caption="$4" name="${5:-}" keyboard rc target
+    keyboard=$(buttons_json) || keyboard=""
+
+    req_reset
+    req_add chat_id "$CHATS_CURRENT"
+    req_add caption "$caption"
+    [ -n "$caption" ] && req_add parse_mode "$(parse_mode_value)"
+    [ "$SILENT" -eq 1 ] && req_add disable_notification "true"
+    [ "$PROTECT" -eq 1 ] && req_add protect_content "true"
+    req_add message_thread_id "$THREAD_ID"
+    req_add reply_to_message_id "$REPLY_TO"
+    req_add reply_markup "$keyboard"
+
+    if is_remote_ref "$path"; then
+        req_add "$field" "$path"
+    else
+        target=$(_safe_path "$path")
+        # A comma or a semicolon would confuse the multipart parser of curl,
+        # so such a path is copied aside and the real name is restored here.
+        [ -n "$name" ] || [ "$target" = "$path" ] || name=$(basename "$path")
+        if [ -n "$name" ]; then
+            req_file "$field" "${target};filename=$(printf '%s' "$name" | tr ',;"' '___')"
+        else
+            req_file "$field" "$target"
+        fi
+    fi
+
+    api_call "$method"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        printf '%s: error: %s\n' "$TG_PING_NAME" "$(api_explain "$API_ERROR")" | redact >&2
+        return "$rc"
+    fi
+    report_result "$CHATS_CURRENT"
+    return 0
+}
+
+send_album() {
+    # send_album CAPTION FILE...
+    local caption="$1"; shift
+    local json="" sep="" i=0 path kind family="" target name
+    for path in "$@"; do
+        kind=$(guess_kind "$path")
+        case "$kind" in
+            photo|video) [ -z "$family" ] && family="visual" ;;
+            *)           family="document" ;;
+        esac
+    done
+    [ "$family" = "document" ] && note "album sent as documents, since Telegram cannot mix documents with photos"
+
+    json="["
+    for path in "$@"; do
+        check_upload "$path"
+        kind=$(guess_kind "$path")
+        [ "$family" = "document" ] && kind="document"
+        name="f$i"
+        json="$json$sep{\"type\":\"$kind\",\"media\":\"attach://$name\""
+        if [ "$i" -eq 0 ] && [ -n "$caption" ]; then
+            json="$json,\"caption\":\"$(printf '%s' "$caption" | json_escape)\""
+            json="$json,\"parse_mode\":\"$(parse_mode_value)\""
+        fi
+        json="$json}"
+        sep=","
+        i=$(( i + 1 ))
+    done
+    json="$json]"
+
+    req_reset
+    req_add chat_id "$CHATS_CURRENT"
+    req_add media "$json"
+    [ "$SILENT" -eq 1 ] && req_add disable_notification "true"
+    [ "$PROTECT" -eq 1 ] && req_add protect_content "true"
+    req_add message_thread_id "$THREAD_ID"
+
+    i=0
+    for path in "$@"; do
+        target=$(_safe_path "$path")
+        req_file "f$i" "$target"
+        i=$(( i + 1 ))
+    done
+
+    api_call sendMediaGroup || {
+        printf '%s: error: %s\n' "$TG_PING_NAME" "$(api_explain "$API_ERROR")" | redact >&2
+        return "$EX_API"
+    }
+    report_result "$CHATS_CURRENT"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Rendering mathematics to an image
+# ---------------------------------------------------------------------------
+
+math_engine_available() {
+    case "$1" in
+        typst) have typst ;;
+        latex) { have latex && have dvipng; } || { have pdflatex && { have pdftoppm || have pdftocairo; }; } ;;
+        *) return 1 ;;
+    esac
+}
+
+render_math_typst() {
+    # render_math_typst SOURCE OUTPUT DPI BACKGROUND
+    local src="$1" out="$2" dpi="$3" bg="$4" wd fill
+    wd=$(workdir)
+    case "$bg" in
+        transparent) fill="none" ;;
+        dark)        fill="rgb(\"#1e1e1e\")" ;;
+        *)           fill="white" ;;
+    esac
+    {
+        printf '#set page(width: auto, height: auto, margin: 14pt, fill: %s)\n' "$fill"
+        [ "$bg" = "dark" ] && printf '#set text(fill: rgb("#e8e8e8"))\n'
+        printf '#set text(size: 20pt)\n'
+        [ -n "$MATH_PREAMBLE" ] && [ -r "$MATH_PREAMBLE" ] && cat "$MATH_PREAMBLE"
+        if [ "$MATH_INLINE" -eq 1 ]; then
+            printf '$%s$\n' "$src"
+        else
+            printf '$ %s $\n' "$src"
+        fi
+    } > "$wd/math.typ"
+    typst compile --format png --ppi "$dpi" "$wd/math.typ" "$out" >"$wd/typst.log" 2>&1
+}
+
+render_math_latex() {
+    # render_math_latex SOURCE OUTPUT DPI BACKGROUND
+    local src="$1" out="$2" dpi="$3" bg="$4" wd tex bgopt fgopt
+    wd=$(workdir); tex="$wd/math.tex"
+    case "$bg" in
+        transparent) bgopt="Transparent"; fgopt="Black" ;;
+        dark)        bgopt="rgb 0.12 0.12 0.12"; fgopt="rgb 0.91 0.91 0.91" ;;
+        *)           bgopt="White"; fgopt="Black" ;;
+    esac
+    {
+        printf '%s\n' '\documentclass[12pt,preview,border=10pt,varwidth=17cm]{standalone}'
+        printf '%s\n' '\usepackage{amsmath,amssymb,amsfonts,mathtools}'
+        [ -n "$MATH_PREAMBLE" ] && [ -r "$MATH_PREAMBLE" ] && cat "$MATH_PREAMBLE"
+        printf '%s\n' '\begin{document}'
+        # A larger base size keeps the formula legible on a phone screen.
+        if [ "$MATH_INLINE" -eq 1 ]; then printf '{\\large $%s$}\n' "$src"
+        else printf '{\\large \\[ %s \\]}\n' "$src"; fi
+        printf '%s\n' '\end{document}'
+    } > "$tex"
+
+    if have latex && have dvipng; then
+        ( cd "$wd" && latex -interaction=nonstopmode -halt-on-error math.tex ) >"$wd/latex.log" 2>&1 &&
+        dvipng -q -D "$dpi" -T tight -bg "$bgopt" -fg "$fgopt" -o "$out" "$wd/math.dvi" >>"$wd/latex.log" 2>&1 && return 0
+    fi
+    if have pdflatex; then
+        ( cd "$wd" && pdflatex -interaction=nonstopmode -halt-on-error math.tex ) >>"$wd/latex.log" 2>&1 || return 1
+        if have pdftoppm; then
+            pdftoppm -png -r "$dpi" -singlefile "$wd/math.pdf" "${out%.png}" >>"$wd/latex.log" 2>&1 && return 0
+        elif have pdftocairo; then
+            pdftocairo -png -r "$dpi" -singlefile "$wd/math.pdf" "${out%.png}" >>"$wd/latex.log" 2>&1 && return 0
+        fi
+    fi
+    return 1
+}
+
+render_math_remote() {
+    # render_math_remote SOURCE OUTPUT DPI BACKGROUND, LaTeX only.
+    local src="$1" out="$2" dpi="$3" bg="$4" bgname
+    case "$bg" in
+        dark)        bgname='\bg{black}\fg{white}' ;;
+        transparent) bgname='' ;;
+        *)           bgname='\bg{white}' ;;
+    esac
+    note "rendering through latex.codecogs.com, the formula leaves this machine"
+    curl -sS -G -o "$out" --max-time "$TIMEOUT" \
+        --data-urlencode "\\dpi{$dpi}${bgname}${src}" \
+        "https://latex.codecogs.com/png.image" 2>/dev/null || return 1
+    [ -s "$out" ] || return 1
+    # The service answers with a tiny error image rather than an HTTP error.
+    [ "$(file_size "$out")" -gt 512 ] || return 1
+    return 0
+}
+
+render_math() {
+    # render_math SOURCE OUTPUT -> 0 on success, engine name in MATH_ENGINE.
+    local src="$1" out="$2"
+    MATH_ENGINE=""
+    if [ "$MATH_SYNTAX" = "typst" ]; then
+        if math_engine_available typst; then
+            MATH_ENGINE="typst"
+            render_math_typst "$src" "$out" "$MATH_DPI" "$MATH_BG" && return 0
+            die "$EX_FAIL" "typst failed to compile the formula. Its log:
+$(tail -n 15 "$(workdir)/typst.log" 2>/dev/null)"
+        fi
+        die "$EX_CONFIG" "typst syntax was requested but typst is not installed.
+  Install it from https://github.com/typst/typst, or drop --typst to use LaTeX."
+    fi
+    if [ "$MATH_REMOTE" -ne 1 ] && math_engine_available latex; then
+        MATH_ENGINE="latex"
+        render_math_latex "$src" "$out" "$MATH_DPI" "$MATH_BG" && return 0
+        warn "the local LaTeX run failed. Its log:
+$(tail -n 15 "$(workdir)/latex.log" 2>/dev/null)"
+        [ "$MATH_REMOTE_OK" -eq 1 ] || return 1
+    fi
+    if [ "$MATH_REMOTE" -eq 1 ] || [ "$MATH_REMOTE_OK" -eq 1 ]; then
+        MATH_ENGINE="codecogs"
+        render_math_remote "$src" "$out" "$MATH_DPI" "$MATH_BG" && return 0
+        return 1
+    fi
+    die "$EX_CONFIG" "no local renderer found for mathematics.
+  Install one of:
+    sudo apt install -y texlive-latex-base texlive-latex-extra dvipng
+    or typst, see https://github.com/typst/typst
+  Alternatively pass --remote to render through latex.codecogs.com, which
+  means sending the formula to a third party."
+}
+
+# ---------------------------------------------------------------------------
+# Tables
+# ---------------------------------------------------------------------------
+
+align_table() {
+    # align_table SEPARATOR HEADER_FLAG, reads rows on stdin.
+    local sep="$1" header="$2"
+    awk -v FS="$sep" -v header="$header" '
+    { for (i = 1; i <= NF; i++) { gsub(/^[ \t]+|[ \t]+$/, "", $i); cell[NR, i] = $i
+        if (length($i) > w[i]) w[i] = length($i) }
+      if (NF > maxf) maxf = NF
+      rows = NR }
+    END {
+        for (r = 1; r <= rows; r++) {
+            line = ""
+            for (c = 1; c <= maxf; c++) {
+                pad = w[c] - length(cell[r, c])
+                spaces = ""
+                while (pad-- > 0) spaces = spaces " "
+                line = line cell[r, c] spaces (c < maxf ? "  " : "")
+            }
+            sub(/[ \t]+$/, "", line)
+            print line
+            if (header == "1" && r == 1) {
+                rule = ""
+                for (c = 1; c <= maxf; c++) {
+                    k = w[c]; while (k-- > 0) rule = rule "-"
+                    if (c < maxf) rule = rule "  "
+                }
+                print rule
+            }
+        }
+    }'
+}
+
+# ---------------------------------------------------------------------------
+# Reading updates, the basis of ask, poll and chats
+# ---------------------------------------------------------------------------
+
+offset_file() {
+    local key
+    key=$(printf '%s' "$TOKEN" | short_hash)
+    printf '%s/offset.%s' "$(state_dir)" "$key"
+}
+
+updates_extract() {
+    # Normalise getUpdates JSON on stdin into tab separated records:
+    #   update_id  kind  chat_id  from_id  payload  callback_id  extra
+    if have jq; then
+        jq -r '
+          def esc: tostring | gsub("\t"; " ") | gsub("\n"; "\\n");
+          .result[]? |
+          if .callback_query then
+            [.update_id, "callback",
+             (.callback_query.message.chat.id // "" | tostring),
+             (.callback_query.from.id // "" | tostring),
+             (.callback_query.data // "" | esc),
+             (.callback_query.id // "" | tostring),
+             (.callback_query.message.message_id // "" | tostring)]
+          elif .message then
+            [.update_id, "message",
+             (.message.chat.id // "" | tostring),
+             (.message.from.id // "" | tostring),
+             (.message.text // .message.caption // "" | esc),
+             "",
+             (.message.chat.type // "" | tostring) + "|" +
+             (.message.chat.title // .message.chat.username // .message.from.first_name // "" | esc)]
+          elif .poll_answer then
+            [.update_id, "poll_answer",
+             "", (.poll_answer.user.id // "" | tostring),
+             ((.poll_answer.option_ids // []) | map(tostring) | join(",")),
+             (.poll_answer.poll_id // "" | tostring), ""]
+          else
+            [.update_id, "other", "", "", "", "", ""]
+          end | @tsv'
+    else
+        python3 -c '
+import json, sys
+def esc(v):
+    return str(v).replace("\t", " ").replace("\n", "\\n")
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for u in data.get("result", []) or []:
+    uid = u.get("update_id", "")
+    if "callback_query" in u:
+        c = u["callback_query"]
+        row = [uid, "callback", c.get("message", {}).get("chat", {}).get("id", ""),
+               c.get("from", {}).get("id", ""), esc(c.get("data", "")), c.get("id", ""),
+               c.get("message", {}).get("message_id", "")]
+    elif "message" in u:
+        m = u["message"]
+        chat = m.get("chat", {})
+        label = chat.get("title") or chat.get("username") or m.get("from", {}).get("first_name", "")
+        row = [uid, "message", chat.get("id", ""), m.get("from", {}).get("id", ""),
+               esc(m.get("text", m.get("caption", ""))), "",
+               esc(chat.get("type", "")) + "|" + esc(label)]
+    elif "poll_answer" in u:
+        p = u["poll_answer"]
+        row = [uid, "poll_answer", "", p.get("user", {}).get("id", ""),
+               ",".join(str(i) for i in p.get("option_ids", [])), p.get("poll_id", ""), ""]
+    else:
+        row = [uid, "other", "", "", "", "", ""]
+    print("\t".join(esc(x) for x in row))
+'
+    fi
+}
+
+fetch_updates() {
+    # fetch_updates OFFSET LONGPOLL_SECONDS -> normalised records on stdout.
+    local offset="$1" wait="$2"
+    req_reset
+    [ -n "$offset" ] && [ "$offset" != "0" ] && req_add offset "$offset"
+    req_add timeout "$wait"
+    req_add allowed_updates '["message","callback_query","poll_answer"]'
+    local saved="$TIMEOUT"
+    TIMEOUT=$(( wait + 10 ))
+    api_call getUpdates
+    local rc=$?
+    TIMEOUT="$saved"
+    if [ "$rc" -ne 0 ]; then
+        case "$API_ERROR" in
+            *"terminated by other getUpdates"*|*"Conflict"*)
+                printf '%s' "another process is already reading this bot's updates.
+  Only one reader at a time is allowed. Stop the other tg-ping, poller or
+  webhook (deleteWebhook) and try again." > "$(workdir)/updates.fatal" ;;
+            *) printf '%s' "$(api_explain "$API_ERROR")" > "$(workdir)/updates.fatal" ;;
+        esac
+        return 0
+    fi
+    printf '%s' "$API_BODY" | updates_extract
+}
+
+updates_check_fatal() {
+    # fetch_updates runs inside a command substitution, where an exit would
+    # only end the subshell, so a fatal error is raised again here.
+    local marker text
+    marker="$(workdir)/updates.fatal"
+    [ -f "$marker" ] || return 0
+    text=$(cat "$marker")
+    rm -f "$marker"
+    die "$EX_API" "$text"
+}
+
+# ---------------------------------------------------------------------------
+# run: wrap a command and report how it went
+# ---------------------------------------------------------------------------
+
+cmd_run() {
+    local label="" notify_start=0 tail_lines="${TG_PING_TAIL:-20}" when="always"
+    local quiet_output=0 exit_zero=0 limit="" rc start elapsed out wd tailtext
+    local passthru=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --label|-l)     label="$2"; shift 2 ;;
+            --notify-start) notify_start=1; shift ;;
+            --tail)         tail_lines="$2"; shift 2 ;;
+            --on)           when="$2"; shift 2 ;;
+            --quiet-output) quiet_output=1; shift ;;
+            --exit-zero)    exit_zero=1; shift ;;
+            --limit)        limit="$2"; shift 2 ;;
+            -h|--help)      help_run; exit "$EX_OK" ;;
+            --)             shift; break ;;
+            -*)
+                # Every other flag belongs to the common set, so that
+                # 'run --silent --chat 123 -- make' behaves as expected.
+                passthru[${#passthru[@]}]="$1"
+                case "${2:-}" in
+                    ""|-*) shift ;;
+                    *)     passthru[${#passthru[@]}]="$2"; shift 2 ;;
+                esac ;;
+            *)              break ;;
+        esac
+    done
+    [ $# -gt 0 ] || die "$EX_USAGE" "'run' needs a command, for example: $TG_PING_NAME run -- make test"
+    [ -n "$label" ] || label="$*"
+    [ ${#passthru[@]} -eq 0 ] || parse_common_args ${passthru[@]+"${passthru[@]}"}
+
+    require_credentials
+    wd=$(workdir); out="$wd/run.log"
+
+    if [ "$notify_start" -eq 1 ]; then
+        # shellcheck disable=SC2030  # a subshell on purpose: the caller's state stays clean
+        ( LEVEL="start"; TITLE="$label"; BODY="started on $(host_name)"; META=1
+          deliver "$(build_message)" ) || true
+    fi
+
+    start=$(date +%s)
+    if [ -n "$limit" ] && have timeout; then
+        set -- timeout "$limit" "$@"
+    elif [ -n "$limit" ]; then
+        warn "--limit needs the 'timeout' utility, running without a deadline"
+    fi
+
+    if [ "$quiet_output" -eq 1 ]; then
+        "$@" >"$out" 2>&1
+        rc=$?
+    else
+        "$@" 2>&1 | tee "$out"
+        rc=${PIPESTATUS[0]}
+    fi
+    elapsed=$(( $(date +%s) - start ))
+
+    case "$when" in
+        success) [ "$rc" -eq 0 ] || { [ "$exit_zero" -eq 1 ] && exit 0; exit "$rc"; } ;;
+        failure|fail) [ "$rc" -ne 0 ] || { [ "$exit_zero" -eq 1 ] && exit 0; exit "$rc"; } ;;
+        never)   [ "$exit_zero" -eq 1 ] && exit 0; exit "$rc" ;;
+    esac
+
+    # shellcheck disable=SC2031  # the values below are the ones set here, not in the subshell above
+    if [ "$rc" -eq 0 ]; then
+        LEVEL="${LEVEL:-success}"; TITLE="${TITLE:-$label}"
+        BODY="${BODY:-finished in $(human_duration "$elapsed")}"
+    else
+        LEVEL="${LEVEL:-error}"; TITLE="${TITLE:-$label}"
+        if [ -n "$limit" ] && [ "$rc" -eq 124 ]; then
+            BODY="${BODY:-timed out after $(human_duration "$elapsed")}"
+        else
+            BODY="${BODY:-failed with exit code $rc after $(human_duration "$elapsed")}"
+        fi
+        if [ "$tail_lines" -gt 0 ] && [ -s "$out" ]; then
+            tailtext=$(tail -n "$tail_lines" "$out" | sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g')
+            CODE_TEXT="$tailtext"; CODE_LANG=""
+        fi
+    fi
+    FIELDS[${#FIELDS[@]}]="exit=$rc"
+    FIELDS[${#FIELDS[@]}]="took=$(human_duration "$elapsed")"
+    META=1
+    deliver "$(build_message)" || warn "the notification itself could not be delivered"
+
+    [ "$exit_zero" -eq 1 ] && exit 0
+    exit "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# progress: one message, edited in place
+# ---------------------------------------------------------------------------
+
+progress_state_file() {
+    printf '%s/progress.%s.%s' "$(state_dir)" \
+        "$(printf '%s' "${CHATS_CURRENT:-default}" | tr -c 'A-Za-z0-9_-' '_')" \
+        "$(printf '%s' "${PROGRESS_KEY:-default}" | tr -c 'A-Za-z0-9_-' '_')"
+}
+
+cmd_progress() {
+    local action="${1:-}"; shift || true
+    local mid="" rc text
+    PROGRESS_KEY="${PROGRESS_KEY:-default}"
+
+    case "$action" in
+        start|update|done|finish|end) ;;
+        ""|-h|--help) help_progress; exit "$EX_OK" ;;
+        *) die "$EX_USAGE" "'progress' expects start, update or done" ;;
+    esac
+
+    parse_common_args "$@"
+    set -- ${REMAINING[@]+"${REMAINING[@]}"}
+    [ -n "$BODY" ] || BODY="$*"
+    read_stdin_if_piped
+    require_credentials
+    CHATS_CURRENT=$(chat_list | head -n1)
+    if [ "$(chat_list | wc -l)" -gt 1 ]; then
+        warn "'progress' edits one message, using chat $CHATS_CURRENT"
+        CHATS="$CHATS_CURRENT"
+    fi
+
+    case "$action" in
+        start)
+            [ -n "$LEVEL" ] || LEVEL="progress"
+            text=$(build_message)
+            deliver "$text" || exit "$EX_API"
+            mid=$(json_get "$API_BODY" "result.message_id")
+            printf '%s' "$mid" > "$(progress_state_file)"
+            [ "$JSON_OUT" -eq 1 ] || printf '%s\n' "$mid"
+            ;;
+        update|done|finish|end)
+            mid="${PROGRESS_ID:-}"
+            [ -n "$mid" ] || mid=$(cat "$(progress_state_file)" 2>/dev/null || true)
+            [ -n "$mid" ] || die "$EX_USAGE" "no message to edit. Start one with '$TG_PING_NAME progress start ...', or pass --id"
+            if [ "$action" != "update" ] && [ -z "$LEVEL" ]; then LEVEL="success"; fi
+            [ -n "$LEVEL" ] || LEVEL="progress"
+            text=$(build_message)
+            req_reset
+            req_add chat_id "$CHATS_CURRENT"
+            req_add message_id "$mid"
+            req_add text "$text"
+            req_add parse_mode "$(parse_mode_value)"
+            [ "$NO_PREVIEW" -eq 1 ] && req_add disable_web_page_preview "true"
+            local kb; kb=$(buttons_json) || kb=""
+            req_add reply_markup "$kb"
+            api_call editMessageText
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+                case "$API_ERROR" in
+                    *"not modified"*) note "the message already carries this text" ;;
+                    *) die "$rc" "$(api_explain "$API_ERROR")" ;;
+                esac
+            fi
+            report_result "$CHATS_CURRENT"
+            [ "$PIN" -eq 1 ] && pin_last "$CHATS_CURRENT"
+            case "$action" in done|finish|end) rm -f "$(progress_state_file)" ;; esac
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# ask: put a question on the phone and wait for the answer
+# ---------------------------------------------------------------------------
+
+cmd_ask() {
+    local deadline wait_total="${ASK_TIMEOUT:-300}" nonce i=0 opt
+    local offset off_file line uid kind chat from payload cbid msgid
+    local start now remaining poll_for chosen="" mid
+
+    need_json_reader ask
+    require_credentials
+    CHATS_CURRENT=$(chat_list | head -n1)
+    if [ "$(chat_list | wc -l)" -gt 1 ]; then
+        warn "'ask' talks to one chat, using $CHATS_CURRENT"
+        CHATS="$CHATS_CURRENT"
+    fi
+    [ -n "$BODY" ] || die "$EX_USAGE" "'ask' needs a question"
+
+    nonce=$(printf '%s%s' "$$" "$(date +%s)" | short_hash | cut -c1-8)
+    BUTTONS=()
+    BUTTON_COLS="${ASK_COLS:-2}"
+    for opt in ${OPTIONS[@]+"${OPTIONS[@]}"}; do
+        BUTTONS[${#BUTTONS[@]}]="cb|$opt|a:$nonce:$i"
+        i=$(( i + 1 ))
+    done
+    [ -n "$LEVEL" ] || LEVEL="question"
+
+    # Consume anything already queued so an old tap cannot answer this question.
+    off_file=$(offset_file)
+    offset=$(cat "$off_file" 2>/dev/null || echo 0)
+    is_number "$offset" || offset=0
+    while IFS="$(printf '\t')" read -r uid kind chat from payload cbid msgid; do
+        [ -n "$uid" ] && offset=$(( uid + 1 ))
+    done <<EOF
+$(fetch_updates "$offset" 0)
+EOF
+    updates_check_fatal
+    printf '%s' "$offset" > "$off_file" 2>/dev/null || true
+
+    deliver "$(build_message)" || exit "$EX_API"
+    mid=$(json_get "$API_BODY" "result.message_id")
+
+    start=$(date +%s)
+    deadline=$(( start + wait_total ))
+    note "waiting up to $(human_duration "$wait_total") for an answer"
+
+    while :; do
+        now=$(date +%s)
+        remaining=$(( deadline - now ))
+        [ "$remaining" -le 0 ] && break
+        poll_for=$remaining
+        [ "$poll_for" -gt 25 ] && poll_for=25
+
+        # shellcheck disable=SC2034  # msgid is read to keep the fields aligned
+        while IFS="$(printf '\t')" read -r uid kind chat from payload cbid msgid; do
+            [ -n "$uid" ] || continue
+            offset=$(( uid + 1 ))
+            printf '%s' "$offset" > "$off_file" 2>/dev/null || true
+            case "$kind" in
+                callback)
+                    case "$payload" in
+                        "a:$nonce:"*)
+                            i=${payload##*:}
+                            chosen=$(printf '%s\n' ${OPTIONS[@]+"${OPTIONS[@]}"} | sed -n "$(( i + 1 ))p")
+                            ANSWER_KIND="button"
+                            # Acknowledge so the phone stops showing a spinner.
+                            req_reset
+                            req_add callback_query_id "$cbid"
+                            req_add text "Recorded: $chosen"
+                            api_call answerCallbackQuery >/dev/null 2>&1 || true
+                            ;;
+                    esac ;;
+                message)
+                    if [ "$ASK_FREE_TEXT" -eq 1 ] && [ "$chat" = "$CHATS_CURRENT" ] && [ -n "$payload" ]; then
+                        chosen=$(printf '%s' "$payload" | sed -e 's/\\n/\n/g')
+                        ANSWER_KIND="text"
+                    fi ;;
+            esac
+            [ -n "$chosen" ] && break
+        done <<EOF
+$(fetch_updates "$offset" "$poll_for")
+EOF
+        updates_check_fatal
+        [ -n "$chosen" ] && break
+    done
+
+    if [ -z "$chosen" ]; then
+        if [ -n "$ASK_DEFAULT" ]; then
+            note "no answer within the deadline, falling back to the default"
+            printf '%s\n' "$ASK_DEFAULT"
+            exit "$EX_OK"
+        fi
+        printf '%s: no answer within %s\n' "$TG_PING_NAME" "$(human_duration "$wait_total")" >&2
+        exit "$EX_TIMEOUT"
+    fi
+
+    # Record the decision in the chat, so the phone shows what was answered.
+    if [ -n "$mid" ] && [ "$mid" != "0" ]; then
+        local record
+        FORMAT_SAVED="$FORMAT"
+        record="$(build_message)
+$(fmt_italic "answered: $chosen")"
+        req_reset
+        req_add chat_id "$CHATS_CURRENT"
+        req_add message_id "$mid"
+        req_add text "$record"
+        req_add parse_mode "$(parse_mode_value)"
+        api_call editMessageText >/dev/null 2>&1 || true
+        FORMAT="$FORMAT_SAVED"
+    fi
+
+    if [ "$JSON_OUT" -eq 1 ]; then
+        printf '{"answer":%s,"kind":"%s"}\n' \
+            "\"$(printf '%s' "$chosen" | json_escape)\"" "${ANSWER_KIND:-button}"
+    else
+        printf '%s\n' "$chosen"
+    fi
+    exit "$EX_OK"
+}
+
+# ---------------------------------------------------------------------------
+# poll: a native Telegram poll
+# ---------------------------------------------------------------------------
+
+cmd_poll() {
+    local json="[" sep="" opt count=0
+    require_credentials
+    CHATS_CURRENT=$(chat_list | head -n1)
+    [ -n "$BODY" ] || die "$EX_USAGE" "'poll' needs a question"
+    [ ${#OPTIONS[@]} -ge 2 ] || die "$EX_USAGE" "'poll' needs at least two --option values"
+
+    for opt in ${OPTIONS[@]+"${OPTIONS[@]}"}; do
+        json="$json$sep\"$(printf '%s' "$opt" | json_escape)\""
+        sep=","
+        count=$(( count + 1 ))
+    done
+    json="$json]"
+
+    req_reset
+    req_add chat_id "$CHATS_CURRENT"
+    req_add question "$BODY"
+    req_add options "$json"
+    req_add is_anonymous "${POLL_ANONYMOUS:-false}"
+    [ "${POLL_MULTI:-0}" -eq 1 ] && req_add allows_multiple_answers "true"
+    if [ -n "${POLL_CORRECT:-}" ]; then
+        req_add type "quiz"
+        req_add correct_option_id "$POLL_CORRECT"
+    fi
+    [ "$SILENT" -eq 1 ] && req_add disable_notification "true"
+    req_add message_thread_id "$THREAD_ID"
+
+    api_call sendPoll || die "$EX_API" "$(api_explain "$API_ERROR")"
+    report_result "$CHATS_CURRENT"
+
+    [ "${POLL_WAIT:-0}" -gt 0 ] || return 0
+
+    need_json_reader "poll --wait"
+    local poll_id off_file offset uid kind chat from payload pid extra deadline now remaining poll_for
+    poll_id=$(json_get "$API_BODY" "result.poll.id")
+    off_file=$(offset_file)
+    offset=$(cat "$off_file" 2>/dev/null || echo 0)
+    is_number "$offset" || offset=0
+    deadline=$(( $(date +%s) + POLL_WAIT ))
+    while :; do
+        now=$(date +%s); remaining=$(( deadline - now ))
+        [ "$remaining" -le 0 ] && break
+        poll_for=$remaining; [ "$poll_for" -gt 25 ] && poll_for=25
+        while IFS="$(printf '\t')" read -r uid kind chat from payload pid extra; do
+            [ -n "$uid" ] || continue
+            offset=$(( uid + 1 ))
+            printf '%s' "$offset" > "$off_file" 2>/dev/null || true
+            if [ "$kind" = "poll_answer" ] && [ "$pid" = "$poll_id" ]; then
+                local idx
+                for idx in $(printf '%s' "$payload" | tr ',' ' '); do
+                    printf '%s\n' "$(printf '%s\n' ${OPTIONS[@]+"${OPTIONS[@]}"} | sed -n "$(( idx + 1 ))p")"
+                done
+                exit "$EX_OK"
+            fi
+        done <<EOF
+$(fetch_updates "$offset" "$poll_for")
+EOF
+        updates_check_fatal
+    done
+    printf '%s: nobody answered the poll within %s\n' "$TG_PING_NAME" "$(human_duration "$POLL_WAIT")" >&2
+    exit "$EX_TIMEOUT"
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+OPTIONS=(); REMAINING=()
+CAPTION=""; MEDIA_AS="auto"; MEDIA_NAME=""
+TABLE_SEP=""; TABLE_HEADER=1
+MATH_DPI="${TG_PING_MATH_DPI:-400}"; MATH_BG="${TG_PING_MATH_BG:-white}"
+MATH_SYNTAX="latex"; MATH_INLINE=0; MATH_OUT=""; MATH_ENGINE=""
+MATH_PREAMBLE="${TG_PING_MATH_PREAMBLE:-}"
+MATH_REMOTE=0; MATH_REMOTE_OK="${TG_PING_MATH_REMOTE:-0}"
+CHATS_CURRENT=""; PROGRESS_ID=""; PROGRESS_KEY="default"
+ASK_TIMEOUT=300; ASK_DEFAULT=""; ASK_FREE_TEXT=1; ASK_COLS=2; ANSWER_KIND=""
+POLL_WAIT=0; POLL_MULTI=0; POLL_ANONYMOUS="false"; POLL_CORRECT=""
+CAPTION_OVERFLOW=""; CAPTION_TEXT=""; FORMAT_SAVED=""
+
+read_file_or_die() {
+    if [ "$1" = "-" ]; then cat
+    else [ -r "$1" ] || die "$EX_USAGE" "cannot read $1"; cat "$1"
+    fi
+}
+
+parse_common_args() {
+    REMAINING=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -m|--message|--text)  BODY="$2"; shift 2 ;;
+            -t|--title)           TITLE="$2"; shift 2 ;;
+            -L|--level)           LEVEL="$2"; shift 2 ;;
+            --emoji)              EMOJI="$2"; shift 2 ;;
+            --info)               LEVEL="info"; shift ;;
+            --ok|--success)       LEVEL="success"; shift ;;
+            --warn|--warning)     LEVEL="warn"; shift ;;
+            --fail|--error)       LEVEL="error"; shift ;;
+            --start)              LEVEL="start"; shift ;;
+            --debug)              LEVEL="debug"; SILENT=1; shift ;;
+            --item)               ITEMS[${#ITEMS[@]}]="$2"; shift 2 ;;
+            --field)              FIELDS[${#FIELDS[@]}]="$2"; shift 2 ;;
+            --code)               if [ "$2" = "-" ]; then CODE_TEXT=$(cat); else CODE_TEXT="$2"; fi
+                                  shift 2 ;;
+            --code-file)          CODE_TEXT=$(read_file_or_die "$2"); shift 2 ;;
+            --lang|--language)    CODE_LANG="$2"; shift 2 ;;
+            --quote)              if [ "$2" = "-" ]; then QUOTE_TEXT=$(cat); else QUOTE_TEXT="$2"; fi
+                                  shift 2 ;;
+            --quote-file)         QUOTE_TEXT=$(read_file_or_die "$2"); shift 2 ;;
+            --collapse)           COLLAPSE=1; shift ;;
+            --percent)            PERCENT="$2"; shift 2 ;;
+            --button)             BUTTONS[${#BUTTONS[@]}]="url|${2%%=*}|${2#*=}"; shift 2 ;;
+            --cols)               BUTTON_COLS="$2"; ASK_COLS="$2"; shift 2 ;;
+            --option|-o)          OPTIONS[${#OPTIONS[@]}]="$2"; shift 2 ;;
+            --meta)               META=1; shift ;;
+            --no-meta)            META=0; shift ;;
+            --prefix)             PREFIX="$2"; shift 2 ;;
+            --format)             FORMAT=$(lc "$2"); shift 2 ;;
+            --plain)              FORMAT="plain"; shift ;;
+            --html)               FORMAT="html"; shift ;;
+            --markdown|--md)      FORMAT="markdown"; shift ;;
+            --no-fallback)        FALLBACK=0; shift ;;
+            --silent|-s)          SILENT=1; shift ;;
+            --pin)                PIN=1; shift ;;
+            --protect)            PROTECT=1; shift ;;
+            --reply-to)           REPLY_TO="$2"; shift 2 ;;
+            --topic|--thread)     THREAD_ID="$2"; shift 2 ;;
+            --preview)            NO_PREVIEW=0; shift ;;
+            --no-preview)         NO_PREVIEW=1; shift ;;
+            --chat|-c)            CHATS="${CHATS:+$CHATS,}$2"; shift 2 ;;
+            --token)              TOKEN="$2"; shift 2 ;;
+            --token-file)         TOKEN=$(read_file_or_die "$2" | tr -d '\r\n'); shift 2 ;;
+            --profile|-P)         PROFILE="$2"; shift 2 ;;
+            --env-file|--config)  ENV_FILE="$2"; shift 2 ;;
+            --api)                API_ROOT="$2"; shift 2 ;;
+            --timeout)            TIMEOUT="$2"; shift 2 ;;
+            --retries)            RETRIES="$2"; shift 2 ;;
+            --insecure)           INSECURE=1; shift ;;
+            --dry-run|-n)         DRY_RUN=1; shift ;;
+            --json)               JSON_OUT=1; shift ;;
+            -v|--verbose)         VERBOSE=1; shift ;;
+            -q|--quiet)           QUIET=1; shift ;;
+            --tee)                TEE=1; shift ;;
+            --soft-fail)          SOFT_FAIL=1; shift ;;
+            --disabled)           DISABLED=1; shift ;;
+            --cooldown)           COOLDOWN="$2"; shift 2 ;;
+            --key)                COOLDOWN_KEY="$2"; PROGRESS_KEY="$2"; shift 2 ;;
+            --id)                 PROGRESS_ID="$2"; shift 2 ;;
+            --truncate)           TRUNCATE=1; shift ;;
+            --max-parts)          MAX_PARTS="$2"; shift 2 ;;
+            --caption)            CAPTION="$2"; shift 2 ;;
+            --name)               MEDIA_NAME="$2"; shift 2 ;;
+            --as)                 MEDIA_AS=$(lc "$2"); shift 2 ;;
+            --dpi)                MATH_DPI="$2"; shift 2 ;;
+            --bg|--background)    MATH_BG=$(lc "$2"); shift 2 ;;
+            --typst)              MATH_SYNTAX="typst"; shift ;;
+            --latex)              MATH_SYNTAX="latex"; shift ;;
+            --inline)             MATH_INLINE=1; shift ;;
+            --display)            MATH_INLINE=0; shift ;;
+            --remote)             MATH_REMOTE=1; MATH_REMOTE_OK=1; shift ;;
+            --out)                MATH_OUT="$2"; shift 2 ;;
+            --preamble)           MATH_PREAMBLE="$2"; shift 2 ;;
+            --sep|--separator)    TABLE_SEP="$2"; shift 2 ;;
+            --no-header)          TABLE_HEADER=0; shift ;;
+            --wait)               ASK_TIMEOUT="$2"; POLL_WAIT="$2"; shift 2 ;;
+            --default)            ASK_DEFAULT="$2"; shift 2 ;;
+            --free-text)          ASK_FREE_TEXT=1; shift ;;
+            --strict)             ASK_FREE_TEXT=0; shift ;;
+            --multi)              POLL_MULTI=1; shift ;;
+            --anonymous)          POLL_ANONYMOUS="true"; shift ;;
+            --correct)            POLL_CORRECT="$2"; shift 2 ;;
+            -h|--help)            HELP_REQUESTED=1; shift ;;
+            --version)            printf '%s %s\n' "$TG_PING_NAME" "$TG_PING_VERSION"; exit "$EX_OK" ;;
+            --)                   shift; while [ $# -gt 0 ]; do REMAINING[${#REMAINING[@]}]="$1"; shift; done ;;
+            -*)                   die "$EX_USAGE" "unknown option: $1
+  Run '$TG_PING_NAME --help' for the full list." ;;
+            *)                    REMAINING[${#REMAINING[@]}]="$1"; shift ;;
+        esac
+    done
+    case "$FORMAT" in
+        auto|plain|html|markdown) ;;
+        *) die "$EX_USAGE" "unknown --format '$FORMAT' (auto, plain, markdown or html)" ;;
+    esac
+}
+
+join_remaining() {
+    local out="" arg
+    for arg in ${REMAINING[@]+"${REMAINING[@]}"}; do
+        if [ -z "$out" ]; then out="$arg"; else out="$out $arg"; fi
+    done
+    printf '%s' "$out"
+}
+
+# ---------------------------------------------------------------------------
+# Commands: text, code, tables, media, mathematics
+# ---------------------------------------------------------------------------
+
+cmd_send() {
+    parse_common_args "$@"
+    [ "${HELP_REQUESTED:-0}" -eq 1 ] && { help_send; exit "$EX_OK"; }
+    [ -n "$BODY" ] || BODY=$(join_remaining)
+    read_stdin_if_piped
+    require_credentials
+    deliver "$(build_message)"
+    exit $?
+}
+
+language_for_extension() {
+    # Telegram highlights by language name, not by file extension.
+    case "$(lc "$1")" in
+        py|pyw)        printf 'python' ;;
+        jl)            printf 'julia' ;;
+        m)             printf 'matlab' ;;
+        f|f90|f95|f03) printf 'fortran' ;;
+        sh|bash|zsh)   printf 'bash' ;;
+        js|mjs)        printf 'javascript' ;;
+        ts)            printf 'typescript' ;;
+        rs)            printf 'rust' ;;
+        rb)            printf 'ruby' ;;
+        c|h)           printf 'c' ;;
+        cc|cpp|cxx|hpp) printf 'cpp' ;;
+        yml|yaml)      printf 'yaml' ;;
+        md|markdown)   printf 'markdown' ;;
+        tex|sty|cls)   printf 'latex' ;;
+        typ)           printf 'typst' ;;
+        ini|cfg|conf)  printf 'ini' ;;
+        patch)         printf 'diff' ;;
+        txt|log|out|err|dat) printf '' ;;
+        *)             printf '%s' "$(lc "$1")" ;;
+    esac
+}
+
+cmd_code() {
+    parse_common_args "$@"
+    [ "${HELP_REQUESTED:-0}" -eq 1 ] && { help_code; exit "$EX_OK"; }
+    local source_file content size
+    source_file=$(join_remaining)
+    if [ -n "$source_file" ] && [ "$source_file" != "-" ]; then
+        [ -r "$source_file" ] || die "$EX_USAGE" "cannot read $source_file"
+        content=$(cat "$source_file")
+        if [ -z "$CODE_LANG" ]; then
+            # Only a real extension names a language: a file called "Makefile"
+            # must not end up tagged as "language-Makefile".
+            case "$(basename "$source_file")" in
+                ?*.?*) CODE_LANG=$(language_for_extension "${source_file##*.}") ;;
+            esac
+        fi
+        [ -n "$TITLE" ] || TITLE=$(basename "$source_file")
+    else
+        content=$(cat)
+    fi
+    [ -n "$content" ] || die "$EX_USAGE" "no code to send"
+    require_credentials
+    CHATS_CURRENT=$(chat_list | head -n1)
+
+    size=$(printf '%s' "$content" | wc -c | tr -d ' ')
+    if [ "$MEDIA_AS" = "document" ] || { [ "$MEDIA_AS" = "auto" ] && [ "$size" -gt $(( TG_MAX_TEXT - 400 )) ]; }; then
+        local wd tmp name
+        wd=$(workdir)
+        name="${MEDIA_NAME:-${source_file:-snippet.txt}}"
+        name=$(basename "$name")
+        tmp="$wd/$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_')"
+        printf '%s\n' "$content" > "$tmp"
+        note "the snippet is $size bytes, sending it as a document"
+        BODY="${BODY:-$size bytes}"
+        local chat
+        caption_split "$(build_message)"
+        for chat in $(chat_list); do
+            CHATS_CURRENT="$chat"
+            send_media_file sendDocument document "$tmp" "$CAPTION_TEXT" "$name" ||
+                exit "$EX_API"
+        done
+        exit "$EX_OK"
+    fi
+    CODE_TEXT="$content"
+    deliver "$(build_message)"
+    exit $?
+}
+
+cmd_table() {
+    parse_common_args "$@"
+    [ "${HELP_REQUESTED:-0}" -eq 1 ] && { help_table; exit "$EX_OK"; }
+    local source_file raw sep
+    source_file=$(join_remaining)
+    if [ -n "$source_file" ] && [ "$source_file" != "-" ]; then
+        raw=$(read_file_or_die "$source_file")
+    else
+        raw=$(cat)
+    fi
+    [ -n "$raw" ] || die "$EX_USAGE" "no rows to format"
+    sep="$TABLE_SEP"
+    if [ -z "$sep" ]; then
+        # Guess the separator from the first line.
+        case "$(printf '%s' "$raw" | head -n1)" in
+            *$'\t'*) sep=$'\t' ;;
+            *\;*)    sep=';' ;;
+            *,*)     sep=',' ;;
+            *)       sep=$'\t' ;;
+        esac
+    fi
+    CODE_TEXT=$(printf '%s\n' "$raw" | align_table "$sep" "$TABLE_HEADER")
+    CODE_LANG=""
+    require_credentials
+    deliver "$(build_message)"
+    exit $?
+}
+
+cmd_media() {
+    # cmd_media METHOD FIELD ARGS..., shared by photo, file and media.
+    local method="$1" field="$2"; shift 2
+    parse_common_args "$@"
+    case "$method" in
+        sendPhoto)    [ "${HELP_REQUESTED:-0}" -eq 1 ] && { help_photo; exit "$EX_OK"; } ;;
+        *)            [ "${HELP_REQUESTED:-0}" -eq 1 ] && { help_file;  exit "$EX_OK"; } ;;
+    esac
+    local files=() arg kind caption chat
+    for arg in ${REMAINING[@]+"${REMAINING[@]}"}; do files[${#files[@]}]="$arg"; done
+    [ ${#files[@]} -gt 0 ] || die "$EX_USAGE" "give at least one file to send"
+
+    [ -n "$CAPTION" ] && BODY="${BODY:-$CAPTION}"
+    require_credentials
+
+    if [ ${#files[@]} -gt 10 ]; then
+        die "$EX_USAGE" "Telegram albums hold at most 10 items, ${#files[@]} were given"
+    fi
+
+    caption_split "$(build_message)"
+    caption="$CAPTION_TEXT"
+
+    for chat in $(chat_list); do
+        CHATS_CURRENT="$chat"
+        if [ ${#files[@]} -gt 1 ]; then
+            send_album "$caption" "${files[@]}" || exit "$EX_API"
+        else
+            arg="${files[0]}"
+            if ! is_remote_ref "$arg"; then check_upload "$arg"; fi
+            kind="$field"
+            if [ "$field" = "auto" ]; then
+                kind=$(guess_kind "$arg")
+                [ "$MEDIA_AS" = "auto" ] || kind="$MEDIA_AS"
+                case "$kind" in
+                    photo)     method="sendPhoto" ;;
+                    video)     method="sendVideo" ;;
+                    audio)     method="sendAudio" ;;
+                    animation) method="sendAnimation" ;;
+                    *)         method="sendDocument"; kind="document" ;;
+                esac
+            fi
+            send_media_file "$method" "$kind" "$arg" "$caption" "$MEDIA_NAME" || exit "$EX_API"
+        fi
+        if [ -n "$CAPTION_OVERFLOW" ]; then
+            note "the caption exceeded ${TG_MAX_CAPTION} characters, sending the rest as a message"
+            # shellcheck disable=SC2030  # a subshell on purpose: only the overflow travels
+            ( TITLE=""; BODY=""; ITEMS=(); FIELDS=(); CODE_TEXT=""; META=0
+              deliver "$CAPTION_OVERFLOW" ) || true
+        fi
+    done
+    exit "$EX_OK"
+}
+
+# shellcheck disable=SC2031  # BODY here is this function's own, not the subshell's
+cmd_math() {
+    parse_common_args "$@"
+    [ "${HELP_REQUESTED:-0}" -eq 1 ] && { help_math; exit "$EX_OK"; }
+    local formula wd png chat
+    formula=$(join_remaining)
+    if [ -z "$formula" ] && [ ! -t 0 ]; then formula=$(cat); fi
+    [ -n "$formula" ] || die "$EX_USAGE" "'math' needs a formula, for example:
+  $TG_PING_NAME math '\\int_0^1 x^2 \\, dx = \\tfrac{1}{3}'"
+
+    wd=$(workdir); png="$wd/math.png"
+    render_math "$formula" "$png" || die "$EX_FAIL" "could not render the formula"
+    [ -s "$png" ] || die "$EX_FAIL" "the renderer produced an empty image"
+    note "rendered with $MATH_ENGINE at ${MATH_DPI} dpi"
+
+    if [ -n "$MATH_OUT" ]; then
+        cp "$png" "$MATH_OUT" || die "$EX_FAIL" "cannot write $MATH_OUT"
+        msg "image written to $MATH_OUT"
+    fi
+
+    [ -n "$BODY" ] || [ -n "$CAPTION" ] || CAPTION=""
+    [ -n "$BODY" ] || BODY="$CAPTION"
+    require_credentials
+    local caption
+    caption_split "$(build_message)"
+    caption="$CAPTION_TEXT"
+    for chat in $(chat_list); do
+        CHATS_CURRENT="$chat"
+        if [ "$MEDIA_AS" = "document" ]; then
+            send_media_file sendDocument document "$png" "$caption" "${MEDIA_NAME:-formula.png}" || exit "$EX_API"
+        else
+            send_media_file sendPhoto photo "$png" "$caption" "" || exit "$EX_API"
+        fi
+    done
+    exit "$EX_OK"
+}
+
+# ---------------------------------------------------------------------------
+# Setup and diagnostics
+# ---------------------------------------------------------------------------
+
+cmd_init() {
+    parse_common_args "$@"
+    local dir file token chat me name n=0 uid kind cid from payload cbid extra
+    local ids="" labels="" choice offset
+
+    dir=$(config_dir); file="$dir/${PROFILE}.env"
+    printf '%s\n' "$TG_PING_NAME setup" "" \
+        "This writes a configuration file to $file." \
+        "Nothing is sent anywhere until the credentials have been checked." ""
+
+    token="$TOKEN"
+    if [ -z "$token" ]; then
+        if [ ! -t 0 ]; then
+            die "$EX_USAGE" "init needs a terminal, or pass --token and --chat explicitly"
+        fi
+        printf '%s\n' "Open Telegram, talk to @BotFather, send /newbot, and copy the token." \
+                      "It looks like 123456789:AAExampleTokenWithLettersAndDigits."
+        printf 'Bot token: '
+        stty -echo 2>/dev/null || true
+        read -r token
+        stty echo 2>/dev/null || true
+        printf '\n'
+    fi
+    [ -n "$token" ] || die "$EX_USAGE" "no token given"
+    TOKEN="$token"
+
+    req_reset
+    api_call getMe || die "$EX_CONFIG" "the token was refused: $(api_explain "$API_ERROR")"
+    name=$(json_get "$API_BODY" "result.username")
+    me=$(json_get "$API_BODY" "result.first_name")
+    if [ -n "$name" ]; then printf 'Bot verified: %s (@%s)\n\n' "$me" "$name"
+    else printf 'Bot verified.\n\n'; fi
+
+    chat="$CHATS"
+    if [ -z "$chat" ]; then
+        need_json_reader init
+        printf '%s\n' "Now open Telegram, find @$name, and send it any message (/start will do)." \
+                      "If you want the alerts in a group, add the bot there and post a message."
+        printf 'Press Enter once you have done that: '
+        read -r _ || true
+        offset=0
+        while IFS="$(printf '\t')" read -r uid kind cid from payload cbid extra; do
+            [ -n "$uid" ] || continue
+            offset=$(( uid + 1 ))
+            [ "$kind" = "message" ] || continue
+            [ -n "$cid" ] || continue
+            case " $ids " in *" $cid "*) continue ;; esac
+            n=$(( n + 1 ))
+            ids="$ids $cid"
+            labels="$labels
+$n) $cid  ${extra}"
+        done <<EOF
+$(fetch_updates 0 2)
+EOF
+        updates_check_fatal
+        if [ "$n" -eq 0 ]; then
+            die "$EX_CONFIG" "no message reached the bot.
+  Send a message to @$name and run '$TG_PING_NAME init' again.
+  In a group, remember that privacy mode hides ordinary messages from bots:
+  either address the bot directly, or disable privacy mode through @BotFather."
+        fi
+        printf '%s\n' "Chats that have written to the bot:$labels" ""
+        if [ "$n" -eq 1 ]; then
+            chat=$(printf '%s' "$ids" | tr ' ' '\n' | grep -v '^$' | head -n1)
+            printf 'Using chat %s.\n' "$chat"
+        else
+            printf 'Which one should receive the notifications? [1] '
+            read -r choice || choice=1
+            is_number "$choice" || choice=1
+            chat=$(printf '%s' "$ids" | tr ' ' '\n' | grep -v '^$' | sed -n "${choice}p")
+        fi
+    fi
+    [ -n "$chat" ] || die "$EX_CONFIG" "no chat id chosen"
+    CHATS="$chat"
+
+    mkdir -p "$dir" || die "$EX_FAIL" "cannot create $dir"
+    chmod 700 "$dir" 2>/dev/null || true
+    if [ -f "$file" ]; then
+        cp "$file" "$file.bak" && msg "previous configuration kept as $file.bak"
+    fi
+    {
+        printf '%s\n' "# tg-ping configuration, profile: $PROFILE"
+        printf '%s\n' "# Written by '$TG_PING_NAME init' on $(date '+%Y-%m-%d %H:%M:%S %Z')."
+        printf '%s\n' "# Keep this file private: it grants full control of the bot."
+        printf 'TG_PING_TOKEN=%s\n' "$TOKEN"
+        printf 'TG_PING_CHAT_ID=%s\n' "$CHATS"
+    } > "$file"
+    chmod 600 "$file" || warn "could not restrict the permissions of $file"
+    msg "configuration written to $file"
+
+    TITLE="tg-ping is ready"
+    BODY="Notifications from $(host_name) will arrive here."
+    LEVEL="success"; META=1
+    deliver "$(build_message)" && msg "a confirmation message was sent to chat $CHATS"
+    exit "$EX_OK"
+}
+
+doctor_line() {
+    # doctor_line STATUS LABEL DETAIL
+    local status="$1" label="$2" detail="$3" mark
+    case "$status" in
+        ok)   mark="[ ok ]" ;;
+        warn) mark="[warn]" ;;
+        *)    mark="[fail]" ;;
+    esac
+    printf '%s %-22s %s\n' "$mark" "$label" "$detail"
+}
+
+cmd_doctor() {
+    parse_common_args "$@"
+    local problems=0 file found="" perms me name
+
+    printf '%s %s on %s\n\n' "$TG_PING_NAME" "$TG_PING_VERSION" "$(uname -s)"
+
+    if have curl; then doctor_line ok "curl" "$(curl --version 2>/dev/null | head -n1 | cut -c1-40)"
+    else doctor_line fail "curl" "missing, install with: sudo apt install -y curl"; problems=$((problems+1)); fi
+
+    if have jq; then doctor_line ok "jq" "$(jq --version 2>/dev/null)"
+    elif have python3; then doctor_line ok "json reader" "python3 (jq not installed, that is fine)"
+    else doctor_line warn "json reader" "neither jq nor python3, 'ask' and 'chats' will not work"; fi
+
+    doctor_line ok "bash" "${BASH_VERSION:-unknown}"
+
+    if math_engine_available typst; then doctor_line ok "math renderer" "typst"
+    elif math_engine_available latex; then doctor_line ok "math renderer" "LaTeX"
+    else doctor_line warn "math renderer" "none, install typst or texlive plus dvipng for 'tg-ping math'"; fi
+
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        if [ -r "$file" ]; then
+            found="$file"
+            # shellcheck disable=SC2012  # ls is the portable way to read a mode string
+            perms=$(ls -l "$file" 2>/dev/null | cut -c1-10)
+            case "$perms" in
+                -rw-------|-r--------) doctor_line ok "config" "$file ($perms)" ;;
+                *) doctor_line warn "config" "$file is readable by others ($perms), run: chmod 600 $file" ;;
+            esac
+            break
+        fi
+    done <<EOF
+$(config_files)
+EOF
+    [ -n "$found" ] || doctor_line warn "config" "no configuration file found, using environment variables only"
+
+    load_config
+    if [ -n "$TOKEN" ]; then
+        case "$TOKEN" in
+            [0-9]*:*) doctor_line ok "token" "present, shape looks right" ;;
+            *) doctor_line warn "token" "present, but the shape is unusual" ;;
+        esac
+    else
+        doctor_line fail "token" "not set, run '$TG_PING_NAME init'"; problems=$((problems+1))
+    fi
+    if [ -n "$CHATS" ]; then doctor_line ok "chat id" "$CHATS"
+    else doctor_line fail "chat id" "not set, run '$TG_PING_NAME init'"; problems=$((problems+1)); fi
+
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*) doctor_line ok "PATH" "\$HOME/.local/bin is on PATH" ;;
+        *) doctor_line warn "PATH" "\$HOME/.local/bin is not on PATH, add it in ~/.profile" ;;
+    esac
+
+    if [ -n "${HTTPS_PROXY:-${https_proxy:-}}" ]; then
+        doctor_line warn "proxy" "HTTPS_PROXY is set, curl will use it"
+    fi
+
+    if [ -n "$TOKEN" ]; then
+        req_reset
+        if api_call getMe; then
+            name=$(json_get "$API_BODY" "result.username")
+            me=$(json_get "$API_BODY" "result.first_name")
+            doctor_line ok "Telegram API" "reachable, bot is $me (@$name)"
+        else
+            doctor_line fail "Telegram API" "$(api_explain "$API_ERROR")"; problems=$((problems+1))
+        fi
+    fi
+
+    if [ "${DOCTOR_SEND:-0}" -eq 1 ] && [ -n "$TOKEN" ] && [ -n "$CHATS" ]; then
+        TITLE="doctor"; BODY="test message from $(host_name)"; LEVEL="ok"
+        if deliver "$(build_message)"; then doctor_line ok "delivery" "test message sent"
+        else doctor_line fail "delivery" "could not send the test message"; problems=$((problems+1)); fi
+    fi
+
+    printf '\n'
+    if [ "$problems" -eq 0 ]; then
+        printf '%s\n' "Everything needed to send messages is in place."
+        exit "$EX_OK"
+    fi
+    printf '%s\n' "$problems problem(s) found. Fix the [fail] lines above, then run doctor again."
+    exit "$EX_CONFIG"
+}
+
+cmd_chats() {
+    parse_common_args "$@"
+    need_json_reader chats
+    require_credentials_token_only
+    local uid kind cid from payload cbid extra seen=""
+    printf '%-16s %-10s %s\n' "CHAT ID" "TYPE" "NAME"
+    # shellcheck disable=SC2034  # from and cbid keep the fields aligned
+    while IFS="$(printf '\t')" read -r uid kind cid from payload cbid extra; do
+        [ "$kind" = "message" ] || continue
+        [ -n "$cid" ] || continue
+        case " $seen " in *" $cid "*) continue ;; esac
+        seen="$seen $cid"
+        printf '%-16s %-10s %s\n' "$cid" "${extra%%|*}" "${extra#*|}"
+    done <<EOF
+$(fetch_updates 0 2)
+EOF
+    updates_check_fatal
+    [ -n "$seen" ] || printf '%s\n' "" "No chat has written to this bot recently." \
+        "Send it a message in Telegram, then run this again." \
+        "Telegram only keeps unread updates for 24 hours."
+    exit "$EX_OK"
+}
+
+require_credentials_token_only() {
+    load_config
+    [ -n "$TOKEN" ] || die "$EX_CONFIG" "no bot token found, run '$TG_PING_NAME init'"
+}
+
+cmd_config() {
+    local action="${1:-show}"; shift || true
+    parse_common_args "$@"
+    local file
+    case "$action" in
+        path)
+            printf '%s\n' "$(config_dir)/${PROFILE}.env" ;;
+        files)
+            config_files ;;
+        show)
+            load_config
+            printf 'profile   : %s\n' "$PROFILE"
+            printf 'config    : %s\n' "$(config_dir)/${PROFILE}.env"
+            printf 'token     : %s\n' "$( [ -n "$TOKEN" ] && printf '%s...%s (hidden)' "$(printf '%s' "$TOKEN" | cut -c1-6)" "$(printf '%s' "$TOKEN" | tail -c 3)" || printf 'not set')"
+            printf 'chat id   : %s\n' "${CHATS:-not set}"
+            printf 'topic     : %s\n' "${THREAD_ID:-none}"
+            printf 'api root  : %s\n' "$API_ROOT"
+            printf 'state dir : %s\n' "$(state_dir)"
+            printf 'sources   : %s\n' "${CONFIG_SOURCES:-environment only}" ;;
+        *)
+            die "$EX_USAGE" "'config' expects path, files or show" ;;
+    esac
+    exit "$EX_OK"
+}
+
+# ---------------------------------------------------------------------------
+# Integration snippets
+# ---------------------------------------------------------------------------
+
+cmd_hook() {
+    local target="${1:-list}"
+    case "$target" in
+        claude)
+            cat <<'EOS'
+## Notifications (tg-ping)
+
+`tg-ping` sends a Telegram message to the user's phone. Use it to keep the
+user informed while you work unattended.
+
+Ping when:
+- a long task starts, so the user knows work is under way;
+- a build, test suite, benchmark or simulation finishes or fails;
+- you produced a figure, a table or a document worth looking at;
+- you are blocked and need a decision;
+- the requested objective is complete.
+
+Keep every message to one or two sentences. Prefer one message per milestone
+over a stream of small updates.
+
+```bash
+tg-ping --ok    --title "Tests green" "142 passed in 38s"
+tg-ping --fail  --title "Build broke" --code-file /tmp/build.log --lang text
+tg-ping photo   figures/convergence.png --caption "Second order confirmed"
+tg-ping math    '\lambda_1 = \pi^2/4' --caption "First eigenvalue"
+tg-ping run --label "full test suite" -- make test
+answer=$(tg-ping ask "Continue with the refactor?" -o yes -o no --wait 900)
+```
+
+Never print or echo the bot token. Never pass `--token` on the command line.
+EOS
+            ;;
+        codex|agents)
+            cat <<'EOS'
+# Notifications
+
+The `tg-ping` command messages the user on Telegram. Run `tg-ping --help` once
+for the full interface. Send a message when a long job starts or ends, when
+something fails, when a figure or document is ready, and when you need a
+decision. One or two sentences per message.
+
+  tg-ping --ok --title "Done" "Refactor complete, 0 regressions"
+  tg-ping --fail --title "make failed" --code-file build.log
+  tg-ping run --label "benchmarks" -- ./bench.sh
+  tg-ping ask "Ship it?" -o ship -o wait --wait 600
+EOS
+            ;;
+        hooks|settings)
+            cat <<'EOS'
+Claude Code hooks. Put this in .claude/settings.json to be notified whenever
+the agent stops and whenever it needs attention:
+
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "tg-ping --ok --title \"Claude finished\" --meta \"Session ended in $(basename \"$PWD\")\""
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "tg-ping --level question --title \"Claude needs you\" --meta \"Waiting in $(basename \"$PWD\")\""
+          }
+        ]
+      }
+    ]
+  }
+}
+EOS
+            ;;
+        bash|trap)
+            cat <<'EOS'
+Notify when a script fails, wherever it fails:
+
+  set -Eeuo pipefail
+  trap 'tg-ping --fail --title "$(basename "$0") failed" \
+        --field "line=$LINENO" --field "exit=$?" --meta' ERR
+  trap 'tg-ping --ok --title "$(basename "$0") finished" --meta' EXIT
+
+Notify only for commands that take longer than a minute:
+
+  long() { tg-ping run --label "$*" --on failure -- "$@"; }
+EOS
+            ;;
+        make)
+            cat <<'EOS'
+Makefile integration:
+
+  NOTIFY := tg-ping
+
+  .PHONY: paper
+  paper:
+	@$(NOTIFY) --start --title "Compiling the paper"
+	@$(NOTIFY) run --label "typst compile" --on failure -- typst compile main.typ
+	@$(NOTIFY) file main.pdf --ok --caption "Paper rebuilt"
+EOS
+            ;;
+        actions|ci)
+            cat <<'EOS'
+GitHub Actions step. Store the credentials as repository secrets:
+
+  - name: Notify Telegram
+    if: always()
+    env:
+      TG_PING_TOKEN: ${{ secrets.TG_PING_TOKEN }}
+      TG_PING_CHAT_ID: ${{ secrets.TG_PING_CHAT_ID }}
+    run: |
+      curl -fsSL https://raw.githubusercontent.com/dutykh/tg-ping/main/bin/tg-ping -o /usr/local/bin/tg-ping
+      chmod +x /usr/local/bin/tg-ping
+      tg-ping --level ${{ job.status == 'success' && 'ok' || 'error' }} \
+              --title "${{ github.workflow }}: ${{ job.status }}" \
+              --field "repo=${{ github.repository }}" \
+              --field "ref=${{ github.ref_name }}" \
+              --button "Run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+EOS
+            ;;
+        systemd)
+            cat <<'EOS'
+Report the failure of any systemd unit. Save as
+/etc/systemd/system/tg-ping-failure@.service:
+
+  [Unit]
+  Description=Telegram alert for %i
+
+  [Service]
+  Type=oneshot
+  EnvironmentFile=/etc/tg-ping/config
+  ExecStart=/usr/local/bin/tg-ping --fail --title "%i failed" --meta
+
+Then add to any unit:  OnFailure=tg-ping-failure@%n.service
+EOS
+            ;;
+        python)
+            cat <<'EOS'
+From Python, for research scripts:
+
+  import subprocess
+
+  def ping(text, level="info", **fields):
+      cmd = ["tg-ping", "--level", level, text]
+      for key, value in fields.items():
+          cmd += ["--field", f"{key}={value}"]
+      subprocess.run(cmd, check=False)
+
+  ping("Sweep finished", level="ok", runs=512, best_error="1.4e-8")
+  subprocess.run(["tg-ping", "photo", "figures/spectrum.png",
+                  "--caption", "Spectrum of the linearised operator"], check=False)
+EOS
+            ;;
+        *)
+            printf '%s\n' "Available snippets:" \
+                "  claude    project instructions for Claude Code (CLAUDE.md)" \
+                "  codex     project instructions for Codex (AGENTS.md)" \
+                "  hooks     Claude Code hooks for .claude/settings.json" \
+                "  bash      ERR and EXIT traps for shell scripts" \
+                "  make      Makefile targets" \
+                "  actions   GitHub Actions step" \
+                "  systemd   OnFailure alerting" \
+                "  python    helper function for research scripts" \
+                "" "Usage: $TG_PING_NAME hook claude >> CLAUDE.md"
+            ;;
+    esac
+    exit "$EX_OK"
+}
+
+cmd_cheatsheet() {
+    cat <<'EOS'
+tg-ping cheat sheet
+
+  tg-ping "text"                          plain notification
+  tg-ping --ok --title "Done" "details"   titled, with a green check
+  tg-ping --fail --title "Broke" --code-file log.txt --lang text
+  echo "$output" | tg-ping --title "Result"
+  tg-ping --item "step one done" --item "step two running"
+  tg-ping --field "error=1.4e-8" --field "runs=512"
+  tg-ping photo fig.png --caption "Convergence"
+  tg-ping photo a.png b.png c.png --caption "Sweep"      album
+  tg-ping file report.pdf --caption "Draft ready"
+  tg-ping code solver.py --lang python
+  tg-ping table results.csv --title "Errors"
+  tg-ping math '\int_0^1 x^2\,dx = \tfrac13'
+  tg-ping run --label "tests" -- make test
+  id=$(tg-ping progress start "Training")
+  tg-ping progress update "epoch 5/20" --percent 25
+  tg-ping progress done "converged"
+  answer=$(tg-ping ask "Which basis?" -o Chebyshev -o Fourier --wait 900)
+
+Levels: --start --info --ok --warn --fail --level question --debug
+Delivery: --silent --pin --topic ID --chat ID --cooldown 300
+Safety: --dry-run --disabled --soft-fail
+Exit codes: 0 sent, 2 usage, 3 config, 4 network, 5 API, 6 rate limit, 7 timeout
+EOS
+    exit "$EX_OK"
+}
+
+cmd_completion() {
+    local shell="${1:-bash}"
+    case "$shell" in
+        bash)
+            cat <<'EOS'
+_tg_ping_completions() {
+    local cur prev commands options
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    commands="send code table math photo file media run progress ask poll init doctor chats config hook cheatsheet completion version help"
+    options="--message --title --level --emoji --item --field --code --code-file --lang --quote --quote-file --collapse --percent --button --cols --option --meta --prefix --format --plain --html --markdown --no-fallback --silent --pin --protect --reply-to --topic --preview --no-preview --chat --token-file --profile --env-file --api --timeout --retries --dry-run --json --verbose --quiet --tee --soft-fail --disabled --cooldown --key --id --truncate --max-parts --caption --name --as --dpi --bg --typst --latex --inline --display --remote --out --preamble --sep --no-header --wait --default --free-text --strict --multi --anonymous --correct --ok --fail --warn --start --info --debug --help --version"
+    case "$prev" in
+        --level|-L) COMPREPLY=($(compgen -W "start info success warn error question debug progress" -- "$cur")); return ;;
+        --format)   COMPREPLY=($(compgen -W "auto plain markdown html" -- "$cur")); return ;;
+        --as)       COMPREPLY=($(compgen -W "auto photo document video audio animation" -- "$cur")); return ;;
+        --bg)       COMPREPLY=($(compgen -W "white transparent dark" -- "$cur")); return ;;
+        hook)       COMPREPLY=($(compgen -W "claude codex hooks bash make actions systemd python" -- "$cur")); return ;;
+        progress)   COMPREPLY=($(compgen -W "start update done" -- "$cur")); return ;;
+        --code-file|--quote-file|--out|--preamble|--env-file|--token-file)
+                    COMPREPLY=($(compgen -f -- "$cur")); return ;;
+    esac
+    if [ "$COMP_CWORD" -eq 1 ]; then
+        COMPREPLY=($(compgen -W "$commands $options" -- "$cur"))
+    else
+        COMPREPLY=($(compgen -W "$options" -- "$cur") $(compgen -f -- "$cur"))
+    fi
+}
+complete -F _tg_ping_completions tg-ping
+EOS
+            ;;
+        zsh)
+            cat <<'EOS'
+#compdef tg-ping
+_tg_ping() {
+    local -a commands
+    commands=(
+        'send:send a text message'
+        'code:send a snippet or file as a code block'
+        'table:send aligned CSV or TSV rows'
+        'math:typeset a formula and send it as an image'
+        'photo:send images, several become an album'
+        'file:send a document'
+        'media:send up to ten files as one album'
+        'run:run a command and report the outcome'
+        'progress:keep one message updated in place'
+        'ask:ask a question and wait for the answer'
+        'poll:send a native poll'
+        'init:interactive setup'
+        'doctor:check the installation'
+        'chats:list known chat ids'
+        'config:show the active configuration'
+        'hook:print integration snippets'
+        'cheatsheet:one screen reference'
+        'completion:print shell completion'
+    )
+    if (( CURRENT == 2 )); then
+        _describe 'command' commands
+    else
+        _files
+    fi
+}
+_tg_ping "$@"
+EOS
+            ;;
+        *) die "$EX_USAGE" "completion supports bash and zsh" ;;
+    esac
+    exit "$EX_OK"
+}
+
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat <<EOS
+$TG_PING_NAME $TG_PING_VERSION, expressive Telegram notifications for terminals and agents.
+
+USAGE
+  $TG_PING_NAME [options] "message text"
+  $TG_PING_NAME <command> [options] [arguments]
+  <command producing output> | $TG_PING_NAME [options]
+
+COMMANDS
+  send        send a text message (the default, the word may be omitted)
+  code        send a snippet or a file as a highlighted code block
+  table       align CSV or TSV rows and send them as a monospace table
+  math        typeset a LaTeX or Typst formula and send it as an image
+  photo       send an image, or several images as one album
+  file        send any document: PDF, log, archive, notebook
+  media       send up to ten files as one album
+  run         run a command, then report how it ended
+  progress    keep a single message updated in place
+  ask         ask a question and wait for the answer on the phone
+  poll        send a native Telegram poll
+  init        interactive setup, writes the configuration file
+  doctor      check the installation, the credentials and the API
+              ('doctor --send' also delivers a test message)
+  chats       list the chat ids that have written to the bot
+  config      show the active configuration and where it came from
+  hook        print integration snippets (claude, codex, hooks, bash, make, actions)
+  cheatsheet  one screen reference, made to paste into agent instructions
+  completion  print shell completion for bash or zsh
+  help        help for a command, for example: $TG_PING_NAME help ask
+
+MESSAGE PARTS, combine them freely
+  -m, --message TEXT    the body; also read from stdin when piped
+  -t, --title TEXT      bold first line
+  -L, --level NAME      start, info, success, warn, error, question, debug, progress
+      --ok --fail --warn --start --info --debug    shorthands for --level
+      --emoji CHAR      use this emoji instead of the level default
+      --item TEXT       a bullet point, repeatable
+      --field KEY=VALUE a bold key followed by its value, repeatable
+      --code TEXT       a code block; --code-file FILE reads it, --lang NAME highlights it
+      --quote TEXT      a block quote; --quote-file FILE reads it, --collapse folds it
+      --percent N       a progress bar
+      --button "L=URL"  an inline button that opens a link, repeatable
+      --meta            footer with host, repository, branch and time
+
+DELIVERY
+  -c, --chat ID         target chat, repeatable, overrides the configuration
+      --topic ID        forum topic (message thread) inside a group
+      --reply-to ID     reply to an existing message
+      --silent          deliver without a notification sound
+      --pin             pin the message after sending
+      --protect         forbid forwarding and saving
+      --preview         allow link previews, which are suppressed by default
+      --cooldown SEC    drop a repeat of the same alert inside this window
+      --key NAME        name the cooldown bucket, or the progress slot
+      --truncate        cut instead of splitting a long message
+      --max-parts N     never send more than N parts (default 8)
+
+FORMATTING
+      --format MODE     auto (default), plain, markdown or html
+        auto      write light Markdown; correctly escaped HTML is emitted, and
+                  if Telegram still refuses the markup the message is resent as
+                  literal plain text, so a notification is never lost
+        plain     send exactly the characters given, nothing is interpreted
+        markdown  Telegram MarkdownV2, escaping is the caller's responsibility
+        html      Telegram HTML, escaping is the caller's responsibility
+      --no-fallback     fail instead of resending as plain text
+  Understood in auto mode:
+      **bold**  *bold*  _italic_  __underline__  ~~strike~~  ||spoiler||
+      \`code\`  \`\`\`lang fenced blocks\`\`\`  [label](url)  - bullets  > quotes
+
+BEHAVIOUR
+  -n, --dry-run         print the request instead of sending it
+      --json            print the raw Telegram reply on stdout
+  -v, --verbose         explain what is happening, on stderr
+  -q, --quiet           suppress everything but errors
+      --tee             also print the message locally
+      --soft-fail       exit 0 even when delivery fails, so a pipeline survives
+      --disabled        do nothing at all, same as TG_PING_DISABLED=1
+      --timeout SEC     per request timeout, default $TIMEOUT
+      --retries N       retries on network errors, 429 and 5xx, default $RETRIES
+  -P, --profile NAME    use a second bot or chat, kept in its own file
+      --env-file FILE   read the credentials from this file
+      --token-file FILE read the token from this file, never from the argument list
+
+CONFIGURATION, first match wins
+  1. command line flags
+  2. environment: TG_PING_TOKEN, TG_PING_CHAT_ID
+  3. --env-file FILE, or \$TG_PING_ENV_FILE
+  4. ./.tg-ping.env
+  5. ./.env, restricted to TG_PING_* and TELEGRAM_* keys
+  6. $(config_dir)/<profile>.env
+  7. /etc/tg-ping/config
+  Files are parsed as KEY=VALUE, never sourced, never evaluated.
+
+ENVIRONMENT
+  TG_PING_TOKEN, TG_PING_CHAT_ID    credentials, chat id may be a comma separated list
+  TG_PING_THREAD_ID                 default forum topic
+  TG_PING_PREFIX                    label put in front of every message
+  TG_PING_FORMAT                    default format, default auto
+  TG_PING_DISABLED=1                turn every call into a silent no-op
+  TG_PING_SOFT_FAIL=1               never fail a pipeline because of a notification
+  TG_PING_NO_DOTENV=1               ignore ./.env and ./.tg-ping.env
+  TG_PING_PROFILE                   profile name, default "default"
+  TG_PING_MATH_REMOTE=1             allow the public LaTeX renderer as a fallback
+
+EXIT CODES
+  0 delivered      2 bad usage       3 missing configuration   4 network failure
+  5 Telegram error 6 rate limited    7 no answer before the deadline
+  run passes the exit code of the wrapped command through unchanged.
+
+EXAMPLES
+  $TG_PING_NAME "Sweep finished, 512 runs, best error 1.4e-8"
+  $TG_PING_NAME --ok --title "Tests green" "142 passed in 38 s" --meta
+  $TG_PING_NAME --fail --title "Build broke" --code-file build.log --lang text
+  make 2>&1 | $TG_PING_NAME --title "make output" --code -
+  $TG_PING_NAME photo figures/convergence.png --caption "Second order confirmed"
+  $TG_PING_NAME file report.pdf --caption "Draft ready for reading"
+  $TG_PING_NAME math '\\int_0^1 x^2 \\, dx = \\tfrac{1}{3}' --caption "Check"
+  $TG_PING_NAME table results.csv --title "Errors per resolution"
+  $TG_PING_NAME run --label "test suite" -- make test
+  id=\$($TG_PING_NAME progress start "Training the network")
+  $TG_PING_NAME progress update "epoch 5 of 20" --percent 25
+  $TG_PING_NAME progress done "converged, loss 3.1e-4"
+  answer=\$($TG_PING_NAME ask "Which basis?" -o Chebyshev -o Fourier --wait 900)
+
+NOTES FOR AGENTS
+  Send a message when a long job starts, when it ends or fails, when a figure
+  or document is ready, when you are blocked on a decision, and when the task
+  is complete. One or two sentences each. Prefer one clear milestone message
+  over a stream of small updates, and use --cooldown when a loop might repeat.
+  Use 'ask' when you need a human decision: it prints the answer on stdout.
+  Never pass a token on the command line and never echo it.
+
+Homepage: https://github.com/dutykh/tg-ping
+EOS
+}
+
+help_send() { cat <<EOS
+$TG_PING_NAME send: deliver a text message.
+
+  $TG_PING_NAME [send] [options] "text"
+  <command> | $TG_PING_NAME [send] [options]
+
+The body may come from the arguments, from --message, or from stdin. Every
+message part described in '$TG_PING_NAME --help' applies here.
+
+  $TG_PING_NAME --ok --title "Deployment finished" "Version 2.3 is live" --meta
+  $TG_PING_NAME --item "data loaded" --item "model fitted" --item "report written"
+  $TG_PING_NAME --field "runs=512" --field "best error=1.4e-8" --title "Sweep"
+  tail -n 40 run.log | $TG_PING_NAME --title "Last lines" --code -
+EOS
+}
+
+help_code() { cat <<EOS
+$TG_PING_NAME code: send a snippet or a file as a highlighted block.
+
+  $TG_PING_NAME code FILE [--lang NAME] [--title TEXT]
+  <command> | $TG_PING_NAME code [--lang NAME]
+
+The language is guessed from the file extension. A snippet too long for one
+message is sent as a document instead, which --as message or --as document
+overrides.
+
+  $TG_PING_NAME code solver.py --lang python --title "Current solver"
+  git diff | $TG_PING_NAME code --lang diff --title "Pending changes"
+EOS
+}
+
+help_table() { cat <<EOS
+$TG_PING_NAME table: align CSV or TSV rows into a monospace block.
+
+  $TG_PING_NAME table FILE [--sep CHAR] [--no-header] [--title TEXT]
+  <command> | $TG_PING_NAME table
+
+The separator is guessed from the first line when --sep is absent. The first
+row is treated as a header and underlined unless --no-header is given.
+
+  $TG_PING_NAME table errors.csv --title "Convergence study"
+  printf 'N\\terror\\n64\\t1.2e-4\\n128\\t7.9e-6\\n' | $TG_PING_NAME table
+EOS
+}
+
+help_photo() { cat <<EOS
+$TG_PING_NAME photo: send one image, or several as an album.
+
+  $TG_PING_NAME photo FILE [FILE...] [--caption TEXT]
+
+Up to ten files become a single album with one caption. A caption longer than
+$TG_MAX_CAPTION characters continues in a follow up message. An http or https
+address may be given instead of a local file.
+
+  $TG_PING_NAME photo figures/spectrum.png --caption "Spectrum of the operator"
+  $TG_PING_NAME photo fig1.png fig2.png fig3.png --caption "Parameter sweep"
+EOS
+}
+
+help_file() { cat <<EOS
+$TG_PING_NAME file: send a document.
+
+  $TG_PING_NAME file FILE [FILE...] [--caption TEXT] [--name NAME] [--as KIND]
+
+Anything up to 50 MiB can be sent. --name changes the file name shown in the
+chat, --as forces photo, document, video, audio or animation.
+
+  $TG_PING_NAME file report.pdf --caption "Draft, section 3 is new"
+  $TG_PING_NAME file data.csv --name "results-2026.csv" --silent
+EOS
+}
+
+help_math() { cat <<EOS
+$TG_PING_NAME math: typeset a formula and send it as an image.
+
+  $TG_PING_NAME math 'LATEX' [--typst] [--dpi N] [--bg white|transparent|dark]
+                     [--inline] [--preamble FILE] [--out FILE] [--remote]
+
+Rendering happens locally, with typst when --typst is given and with LaTeX
+otherwise (latex and dvipng, or pdflatex and pdftoppm). --preamble adds your
+own macro definitions. --remote falls back to latex.codecogs.com, which means
+the formula leaves this machine, and is off unless asked for.
+
+  $TG_PING_NAME math '\\nabla^2 u = f, \\quad u|_{\\partial\\Omega} = 0'
+  $TG_PING_NAME math --typst 'integral_0^1 x^2 dif x = 1/3'
+  $TG_PING_NAME math '\\lambda_1 = \\pi^2/4' --caption "First eigenvalue" --dpi 400
+  $TG_PING_NAME math '\\hat{u}(k)' --out formula.png --dpi 600 --as document
+EOS
+}
+
+help_run() { cat <<EOS
+$TG_PING_NAME run: run a command and report how it ended.
+
+  $TG_PING_NAME run [--label TEXT] [--notify-start] [--tail N] [--on WHEN]
+                    [--limit SECONDS] [--quiet-output] [--exit-zero] -- COMMAND...
+
+The output still reaches the terminal. The exit code of COMMAND is passed
+through, so run can wrap a build step without changing its meaning.
+--on takes always (default), success, failure or never. On failure the last
+--tail lines (default 20) travel with the message.
+
+  $TG_PING_NAME run --label "test suite" -- make test
+  $TG_PING_NAME run --notify-start --tail 50 --limit 3600 -- python train.py
+  $TG_PING_NAME run --on failure --exit-zero -- ./flaky-check.sh
+EOS
+}
+
+help_progress() { cat <<EOS
+$TG_PING_NAME progress: keep one message updated in place.
+
+  $TG_PING_NAME progress start "text" [--key NAME]     prints the message id
+  $TG_PING_NAME progress update "text" [--percent N] [--id ID] [--key NAME]
+  $TG_PING_NAME progress done "text" [--ok|--fail] [--pin]
+
+A long computation then occupies one line of the chat instead of fifty. The
+message id is remembered per chat and per --key, so --id is rarely needed.
+
+  $TG_PING_NAME progress start "Training the network"
+  for epoch in \$(seq 1 20); do
+      $TG_PING_NAME progress update "epoch \$epoch of 20" --percent \$(( epoch * 5 ))
+  done
+  $TG_PING_NAME progress done "converged, final loss 3.1e-4"
+EOS
+}
+
+help_ask() { cat <<EOS
+$TG_PING_NAME ask: put a question on the phone and wait for the answer.
+
+  $TG_PING_NAME ask "question" -o OPTION [-o OPTION...] [--wait SECONDS]
+                    [--default TEXT] [--strict] [--cols N]
+
+The options appear as buttons. The answer is printed on stdout, so it can be
+captured. A typed reply is accepted as well, unless --strict is given. Without
+an answer before the deadline the exit code is 7, or the --default value is
+printed and the exit code is 0.
+
+  answer=\$($TG_PING_NAME ask "Which basis?" -o Chebyshev -o Fourier --wait 900)
+  case "\$answer" in Chebyshev) ... ;; Fourier) ... ;; esac
+
+  $TG_PING_NAME ask "Continue after the failing test?" -o yes -o no --default no
+
+Only one process may read a bot's updates at a time, so ask cannot run in
+parallel with another ask, poll --wait, chats, or a webhook on the same bot.
+EOS
+}
+
+help_poll() { cat <<EOS
+$TG_PING_NAME poll: send a native Telegram poll.
+
+  $TG_PING_NAME poll "question" -o OPTION -o OPTION [--multi] [--anonymous]
+                     [--correct INDEX] [--wait SECONDS]
+
+--correct turns the poll into a quiz. --wait blocks until somebody answers and
+prints the chosen options.
+
+  $TG_PING_NAME poll "Which figure goes in the paper?" -o "spectrum" -o "residual" -o "both"
+EOS
+}
+
+help_command() {
+    case "${1:-}" in
+        send|msg|message) help_send ;;
+        code)             help_code ;;
+        table)            help_table ;;
+        photo|image|img)  help_photo ;;
+        file|doc|document|media) help_file ;;
+        math|formula)     help_math ;;
+        run|exec|wrap)    help_run ;;
+        progress)         help_progress ;;
+        ask)              help_ask ;;
+        poll)             help_poll ;;
+        ""|-h|--help)     usage ;;
+        *)                usage ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+HELP_REQUESTED=0
+
+main() {
+    [ $# -eq 0 ] && { usage; exit "$EX_USAGE"; }
+    case "$1" in
+        -h|--help|help|version|--version|cheatsheet|cheat|hook|hooks|completion) ;;
+        *) workdir_init ;;
+    esac
+    case "$1" in
+        send|msg|message)   shift; cmd_send "$@" ;;
+        code|snippet)       shift; cmd_code "$@" ;;
+        table)              shift; cmd_table "$@" ;;
+        math|formula)       shift; cmd_math "$@" ;;
+        photo|image|img)    shift; cmd_media sendPhoto photo "$@" ;;
+        file|doc|document)  shift; cmd_media sendDocument document "$@" ;;
+        media|album)        shift; cmd_media auto auto "$@" ;;
+        run|exec|wrap)      shift; cmd_run "$@" ;;
+        progress)           shift; cmd_progress "$@" ;;
+        ask)                shift; parse_common_args "$@"
+                            [ "$HELP_REQUESTED" -eq 1 ] && { help_ask; exit "$EX_OK"; }
+                            [ -n "$BODY" ] || BODY=$(join_remaining)
+                            cmd_ask ;;
+        poll)               shift; parse_common_args "$@"
+                            [ "$HELP_REQUESTED" -eq 1 ] && { help_poll; exit "$EX_OK"; }
+                            [ -n "$BODY" ] || BODY=$(join_remaining)
+                            cmd_poll; exit $? ;;
+        init|setup)         shift; cmd_init "$@" ;;
+        doctor|check)       shift
+                            case "${1:-}" in --send) DOCTOR_SEND=1; shift ;; esac
+                            cmd_doctor "$@" ;;
+        chats|whoami)       shift; cmd_chats "$@" ;;
+        config)             shift; cmd_config "$@" ;;
+        hook|hooks)         shift; cmd_hook "$@" ;;
+        cheatsheet|cheat)   shift; cmd_cheatsheet ;;
+        completion)         shift; cmd_completion "$@" ;;
+        version|--version)  printf '%s %s\n' "$TG_PING_NAME" "$TG_PING_VERSION"; exit "$EX_OK" ;;
+        help)               shift; help_command "${1:-}"; exit "$EX_OK" ;;
+        -h|--help)          usage; exit "$EX_OK" ;;
+        *)                  cmd_send "$@" ;;
+    esac
+}
+
+main "$@"
