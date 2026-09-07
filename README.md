@@ -177,7 +177,67 @@ wins:
 
 Configuration files are parsed as `KEY=VALUE`. They are never sourced and never
 evaluated, so a hostile file cannot execute anything: a value such as
-`$(rm -rf /)` stays a harmless string and is rejected as a malformed chat id.
+`$(rm -rf /)` stays a harmless string and is rejected as a malformed chat id. A
+path written in one of them may begin with `~/`, which is expanded.
+
+### Where the credentials belong
+
+Put them in `~/.config/tg-ping/default.env`, which is read from every
+directory. An agent working in a different project then reaches you with no
+further setup:
+
+```bash
+tg-ping init          # writes that file with mode 600
+```
+
+A file in the working directory overrides it, which is how one project sends to
+a different bot, chat or topic. `./.env.local` and `./.env` are names shared
+with other tools, so only the namespaced `TG_PING_*` and `TELEGRAM_*` keys are
+read from them: a bare `BOT_TOKEN` sitting in such a file belongs to somebody
+else and is ignored. `./.tg-ping.env` is ours alone and is read in full.
+
+### Every setting, not only the credentials
+
+Anything below can live in a configuration file, in the environment, or on the
+command line, in that increasing order of priority.
+
+| Variable | Effect | Default |
+| --- | --- | --- |
+| `TG_PING_TOKEN` | bot token from `@BotFather` | required |
+| `TG_PING_CHAT_ID` | target chat, or a comma separated list of them | required |
+| `TG_PING_THREAD_ID` | forum topic inside a group | none |
+| `TG_PING_PREFIX` | fixed label in front of every message | none |
+| `TG_PING_FORMAT` | `auto`, `plain`, `markdown` or `html` | `auto` |
+| `TG_PING_TAIL` | log lines carried by a failed `run` | `20` |
+| `TG_PING_MAX_PARTS` | parts a long message may be split into | `8` |
+| `TG_PING_BAR_WIDTH` | width of the `--percent` bar | `12` |
+| `TG_PING_TIMEOUT` | seconds allowed per request | `20` |
+| `TG_PING_RETRIES` | retries on network errors, 429 and 5xx | `3` |
+| `TG_PING_MATH_DPI` | resolution of a rendered formula | `400` |
+| `TG_PING_MATH_BG` | `white`, `transparent` or `dark` | `white` |
+| `TG_PING_MATH_PREAMBLE` | your own macros, see [Mathematics](#mathematics) | none |
+| `TG_PING_MATH_REMOTE` | allow the public renderer as a fallback | `0` |
+| `TG_PING_SOFT_FAIL` | never fail because a notification failed | `0` |
+| `TG_PING_DISABLED` | turn every call into a silent no-op | `0` |
+| `TG_PING_API` | alternative Bot API endpoint | Telegram |
+| `TG_PING_NO_DOTENV` | ignore the files in the working directory | `0` |
+| `TG_PING_PROFILE` | which profile to use | `default` |
+
+The last two decide which files are read in the first place, so they take
+effect from the environment or from a flag only, never from inside a file.
+
+`tg-ping config show` prints what was resolved and where each credential came
+from, which settles any question about precedence:
+
+```text
+config    : /home/you/.config/tg-ping/default.env
+token from: /home/you/.config/tg-ping/default.env
+format    : auto
+math      : 400 dpi, white background, remote never
+preamble  : /home/you/.config/tg-ping/macros.tex
+network   : 20s timeout, 3 retries
+run tail  : 20 lines
+```
 
 Start from [`.env.example`](.env.example), which documents every variable:
 
@@ -216,6 +276,10 @@ tg-ping --fail --title "Build broke" --code-file build.log --lang text
 
 # anything on a pipe
 make 2>&1 | tg-ping --title "make output" --code -
+
+# a snippet, with the language taken from the file extension
+tg-ping code solver.jl --title "current solver"
+git diff | tg-ping code --lang diff --title "pending changes"
 
 # a figure, an album, a document
 tg-ping photo figures/spectrum.png --caption "Spectrum of the linearised operator"
@@ -308,6 +372,32 @@ Useful options: `--dpi N` (400 by default, which is legible on a phone),
 style, `--out FILE` to keep the image, and `--preamble FILE` to load your own
 macros, so the notation of your papers reaches your phone unchanged.
 
+### Your own macros
+
+Point `TG_PING_MATH_PREAMBLE`, or `--preamble FILE`, at a file of definitions.
+It is inserted after `amsmath`, `amssymb`, `amsfonts` and `mathtools`, so the
+notation of your papers reaches your phone unchanged:
+
+```tex
+% ~/.config/tg-ping/macros.tex
+\usepackage{bm}
+\let\le\leqslant                        % the slanted relations
+\let\ge\geqslant
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\eps}{\varepsilon}
+\DeclarePairedDelimiter{\norm}{\lVert}{\rVert}
+\DeclareMathOperator{\supp}{supp}
+```
+
+```bash
+tg-ping math '\norm{u - u_h} \le C \eps^2, \quad \supp u \subset \R^2'
+```
+
+The extension decides which engine reads the file, `.tex` for LaTeX and `.typ`
+for typst. The other engine ignores it and says so, rather than typesetting
+your preamble into the picture. A path that cannot be read raises a warning and
+the formula is rendered without it.
+
 If no local renderer is installed, `--remote` (or `TG_PING_MATH_REMOTE=1`)
 falls back to the public service at `latex.codecogs.com`. That sends the
 formula to a third party, so it is never used unless you ask for it.
@@ -330,7 +420,9 @@ tg-ping run --on failure -- ./nightly.sh          # only complain when it breaks
 A failure arrives with the exit code, the elapsed time and the last lines of
 the output. `--tail N` sets how many, `--on` takes `always`, `success`,
 `failure` or `never`, `--limit SECONDS` applies a deadline, and `--exit-zero`
-keeps a failing command from failing your script.
+keeps a failing command from failing your script. The common options work here
+too, so `--chat`, `--silent`, `--topic` and the rest may appear before the `--`
+that introduces the command.
 
 For work that reports its own progress, `progress` keeps a single message up to
 date instead of filling the chat:
@@ -430,7 +522,8 @@ what you want inside test suites and continuous integration.
   in `ps`. Pass credentials through the environment, a configuration file or
   `--token-file`, never through `--token` on a shared machine.
 * **Configuration files are parsed, not executed.** No `source`, no `eval`.
-* **Secrets stay out of git.** `.gitignore` covers `.env` and `*.env`;
+* **Secrets stay out of git.** `.gitignore` covers `.env`, `.env.local`,
+  `.tg-ping.env` and `*.env`;
   `tg-ping init` writes its file with mode 600 and `tg-ping doctor` complains
   if the permissions are loose.
 * **Output is redacted.** Verbose logs, error messages and `--dry-run` replace
@@ -457,6 +550,8 @@ and your `PATH`. Add `--send` to also deliver a test message.
 | `another process is already reading this bot's updates` | Stop the other `ask`, `poll --wait` or webhook, or use a second bot through `--profile`. |
 | A message with markup never arrives | It should not happen: the plain text fallback catches it. If you passed `--no-fallback`, remove it, or use `--plain`. |
 | Group messages are ignored | Telegram privacy mode. Address the bot directly, or disable privacy through `@BotFather`. |
+| A setting in a file has no effect | Run `tg-ping config show` to see what was resolved and from where. An environment variable or a flag beats the file. A bare `BOT_TOKEN` or `CHAT_ID` is ignored in `./.env` and `./.env.local`, although it is honoured in the other files. |
+| Formulas render without my macros | The preamble extension must match the engine, `.tex` for LaTeX and `.typ` for typst, and the path must be readable. Both cases warn on stderr. |
 | `tg-ping: command not found` | `~/.local/bin` is not on your `PATH`. See [Installation on Ubuntu](#installation-on-ubuntu). |
 
 ## Development
@@ -471,10 +566,12 @@ tests/run-tests.sh format          # only the cases whose name matches
 shellcheck -x bin/tg-ping install.sh tests/run-tests.sh
 ```
 
-It covers configuration precedence, the safety of the `.env` parser, HTML
-escaping, message splitting, retries on 429, the plain text fallback, media
-uploads, exit codes, the two-way `ask` flow and the help output. Please add a
-case with any change in behaviour.
+Forty six cases cover configuration precedence, the scoping of `./.env` and
+`./.env.local`, settings other than credentials arriving from a file, the
+safety of the parser against a hostile file, HTML escaping, message splitting,
+retries on 429, the plain text fallback, media uploads, exit codes, the two-way
+`ask` flow and the help output. Please add a case with any change in
+behaviour.
 
 Portability: the tool targets Bash 3.2 and newer, so it also runs on a stock
 macOS shell. Please keep to that (no associative arrays, no `mapfile`) and keep
