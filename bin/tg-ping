@@ -44,7 +44,6 @@ CHATS=""                  # comma separated list, resolved late
 PROFILE="${TG_PING_PROFILE:-default}"
 API_ROOT="${TG_PING_API:-https://api.telegram.org}"
 ENV_FILE="${TG_PING_ENV_FILE:-}"
-CONFIG_SOURCES=""
 
 VERBOSE=0
 QUIET=0
@@ -229,8 +228,29 @@ lookup_setting() {
             esac
             value=$(env_file_get "$file" "$key") || continue
             if [ -n "$value" ]; then
-                CONFIG_SOURCES="${CONFIG_SOURCES}${file} "
                 printf '%s' "$value"
+                return 0
+            fi
+        done
+    done <<EOF
+$(config_files)
+EOF
+    return 1
+}
+
+setting_file() {
+    # setting_file KEY [ALIAS...] -> the first file that defines any of them.
+    local file key
+    while IFS= read -r file; do
+        [ -n "$file" ] && [ -r "$file" ] || continue
+        for key in "$@"; do
+            case "$file" in
+                ./.env|./.env.local)
+                    case "$key" in TG_PING_*|TELEGRAM_*) ;; *) continue ;; esac
+                    ;;
+            esac
+            if env_file_get "$file" "$key" >/dev/null 2>&1; then
+                printf '%s' "$file"
                 return 0
             fi
         done
@@ -265,6 +285,49 @@ load_config() {
     [ -n "${TG_PING_API:-}" ] || {
         local api; api=$(lookup_setting TG_PING_API) && [ -n "$api" ] && API_ROOT="$api"
     }
+    return 0
+}
+
+load_file_settings() {
+    # Fill the non credential settings from the configuration files. A value
+    # already present in the environment is left alone, and flags parsed later
+    # override whatever is decided here.
+    local v
+    _from_file() {
+        # _from_file ENV_NAME KEY -> prints the file value, or nothing.
+        eval "[ -n \"\${$1:-}\" ]" && return 1
+        v=$(lookup_setting "$2") || return 1
+        [ -n "$v" ] || return 1
+        return 0
+    }
+    _from_file TG_PING_FORMAT      TG_PING_FORMAT      && FORMAT=$(lc "$v")
+    _from_file TG_PING_TIMEOUT     TG_PING_TIMEOUT     && TIMEOUT="$v"
+    _from_file TG_PING_RETRIES     TG_PING_RETRIES     && RETRIES="$v"
+    _from_file TG_PING_MAX_PARTS   TG_PING_MAX_PARTS   && MAX_PARTS="$v"
+    _from_file TG_PING_TAIL        TG_PING_TAIL        && RUN_TAIL="$v"
+    _from_file TG_PING_BAR_WIDTH   TG_PING_BAR_WIDTH   && BAR_WIDTH="$v"
+    _from_file TG_PING_SOFT_FAIL   TG_PING_SOFT_FAIL   && SOFT_FAIL="$v"
+    _from_file TG_PING_DISABLED    TG_PING_DISABLED    && DISABLED="$v"
+    _from_file TG_PING_MATH_DPI    TG_PING_MATH_DPI    && MATH_DPI="$v"
+    _from_file TG_PING_MATH_BG     TG_PING_MATH_BG     && MATH_BG=$(lc "$v")
+    _from_file TG_PING_MATH_PREAMBLE TG_PING_MATH_PREAMBLE && MATH_PREAMBLE="$v"
+    # shellcheck disable=SC2088  # the tilde is matched literally, then expanded
+    case "$MATH_PREAMBLE" in "~/"*) MATH_PREAMBLE="$HOME/${MATH_PREAMBLE#\~/}" ;; esac
+    _from_file TG_PING_MATH_REMOTE TG_PING_MATH_REMOTE && MATH_REMOTE_OK="$v"
+    return 0
+}
+
+preparse_config_flags() {
+    # Only the flags that decide which files are read. Everything else waits
+    # for parse_common_args, so that flags keep the last word.
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --profile|-P)        PROFILE="${2:-$PROFILE}"; shift 2 || break ;;
+            --env-file|--config) ENV_FILE="${2:-$ENV_FILE}"; shift 2 || break ;;
+            --)                  break ;;
+            *)                   shift ;;
+        esac
+    done
     return 0
 }
 
@@ -892,6 +955,7 @@ QUOTE_TEXT=""; COLLAPSE=0; CODE_TEXT=""; CODE_LANG=""; PERCENT=""
 FORMAT="${TG_PING_FORMAT:-auto}"
 SILENT=0; PIN=0; PROTECT=0; REPLY_TO=""; NO_PREVIEW=1
 TRUNCATE=0; MAX_PARTS="${TG_PING_MAX_PARTS:-8}"
+RUN_TAIL="${TG_PING_TAIL:-20}"; BAR_WIDTH="${TG_PING_BAR_WIDTH:-12}"
 COOLDOWN=""; COOLDOWN_KEY=""; TEE=0
 BUTTON_COLS=1
 ITEMS=(); FIELDS=(); BUTTONS=()
@@ -923,7 +987,7 @@ $(format_text "$BODY")"
 
     if [ -n "$PERCENT" ]; then
         out="$out
-$(progress_bar "$PERCENT" "${TG_PING_BAR_WIDTH:-12}")"
+$(progress_bar "$PERCENT" "$BAR_WIDTH")"
     fi
 
     for item in ${ITEMS[@]+"${ITEMS[@]}"}; do
@@ -1307,7 +1371,12 @@ render_math_typst() {
         printf '#set page(width: auto, height: auto, margin: 14pt, fill: %s)\n' "$fill"
         [ "$bg" = "dark" ] && printf '#set text(fill: rgb("#e8e8e8"))\n'
         printf '#set text(size: 20pt)\n'
-        [ -n "$MATH_PREAMBLE" ] && [ -r "$MATH_PREAMBLE" ] && cat "$MATH_PREAMBLE"
+        if [ -n "$MATH_PREAMBLE" ] && [ -r "$MATH_PREAMBLE" ]; then
+            case "$MATH_PREAMBLE" in
+                *.typ) cat "$MATH_PREAMBLE" ;;
+                *) warn "the preamble $MATH_PREAMBLE is not a .typ file, ignoring it for typst" ;;
+            esac
+        fi
         if [ "$MATH_INLINE" -eq 1 ]; then
             printf '$%s$\n' "$src"
         else
@@ -1329,7 +1398,12 @@ render_math_latex() {
     {
         printf '%s\n' '\documentclass[12pt,preview,border=10pt,varwidth=17cm]{standalone}'
         printf '%s\n' '\usepackage{amsmath,amssymb,amsfonts,mathtools}'
-        [ -n "$MATH_PREAMBLE" ] && [ -r "$MATH_PREAMBLE" ] && cat "$MATH_PREAMBLE"
+        if [ -n "$MATH_PREAMBLE" ] && [ -r "$MATH_PREAMBLE" ]; then
+            case "$MATH_PREAMBLE" in
+                *.typ) warn "the preamble $MATH_PREAMBLE is a typst file, ignoring it for LaTeX" ;;
+                *) cat "$MATH_PREAMBLE" ;;
+            esac
+        fi
         printf '%s\n' '\begin{document}'
         # A larger base size keeps the formula legible on a phone screen.
         if [ "$MATH_INLINE" -eq 1 ]; then printf '{\\large $%s$}\n' "$src"
@@ -1374,6 +1448,10 @@ render_math() {
     # render_math SOURCE OUTPUT -> 0 on success, engine name in MATH_ENGINE.
     local src="$1" out="$2"
     MATH_ENGINE=""
+    if [ -n "$MATH_PREAMBLE" ] && [ ! -r "$MATH_PREAMBLE" ]; then
+        warn "the preamble $MATH_PREAMBLE cannot be read, rendering without it"
+        MATH_PREAMBLE=""
+    fi
     if [ "$MATH_SYNTAX" = "typst" ]; then
         if math_engine_available typst; then
             MATH_ENGINE="typst"
@@ -1554,7 +1632,7 @@ updates_check_fatal() {
 # ---------------------------------------------------------------------------
 
 cmd_run() {
-    local label="" notify_start=0 tail_lines="${TG_PING_TAIL:-20}" when="always"
+    local label="" notify_start=0 tail_lines="$RUN_TAIL" when="always"
     local quiet_output=0 exit_zero=0 limit="" rc start elapsed out wd tailtext
     local passthru=()
 
@@ -1651,19 +1729,24 @@ progress_state_file() {
 }
 
 cmd_progress() {
-    local action="${1:-}"; shift || true
-    local mid="" rc text
+    local mid="" rc text action i rest=""
+    parse_common_args "$@"
+    [ "${HELP_REQUESTED:-0}" -eq 1 ] && { help_progress; exit "$EX_OK"; }
     PROGRESS_KEY="${PROGRESS_KEY:-default}"
 
+    action="${REMAINING[0]:-}"
     case "$action" in
         start|update|done|finish|end) ;;
-        ""|-h|--help) help_progress; exit "$EX_OK" ;;
-        *) die "$EX_USAGE" "'progress' expects start, update or done" ;;
+        "") help_progress; exit "$EX_USAGE" ;;
+        *) die "$EX_USAGE" "'progress' expects start, update or done, not '$action'" ;;
     esac
 
-    parse_common_args "$@"
-    set -- ${REMAINING[@]+"${REMAINING[@]}"}
-    [ -n "$BODY" ] || BODY="$*"
+    i=1
+    while [ "$i" -lt "${#REMAINING[@]}" ]; do
+        rest="${rest:+$rest }${REMAINING[$i]}"
+        i=$(( i + 1 ))
+    done
+    [ -n "$BODY" ] || BODY="$rest"
     read_stdin_if_piped
     require_credentials
     CHATS_CURRENT=$(chat_list | head -n1)
@@ -2455,9 +2538,9 @@ require_credentials_token_only() {
 }
 
 cmd_config() {
-    local action="${1:-show}"; shift || true
     parse_common_args "$@"
-    local file
+    [ "${HELP_REQUESTED:-0}" -eq 1 ] && { usage; exit "$EX_OK"; }
+    local action="${REMAINING[0]:-show}"
     case "$action" in
         path)
             printf '%s\n' "$(config_dir)/${PROFILE}.env" ;;
@@ -2472,7 +2555,17 @@ cmd_config() {
             printf 'topic     : %s\n' "${THREAD_ID:-none}"
             printf 'api root  : %s\n' "$API_ROOT"
             printf 'state dir : %s\n' "$(state_dir)"
-            printf 'sources   : %s\n' "${CONFIG_SOURCES:-environment only}" ;;
+            local src
+            src=$(setting_file TG_PING_TOKEN TG_PING_BOT_TOKEN TELEGRAM_BOT_TOKEN TELEGRAM_TOKEN BOT_TOKEN) || src=""
+            printf 'token from: %s\n' "${TG_PING_TOKEN:+the environment}${TG_PING_TOKEN:-${src:-nowhere}}"
+            src=$(setting_file TG_PING_CHAT_ID TELEGRAM_CHAT_ID TG_PING_CHAT CHAT_ID) || src=""
+            printf 'chat from : %s\n' "${TG_PING_CHAT_ID:+the environment}${TG_PING_CHAT_ID:-${src:-nowhere}}"
+            printf 'format    : %s\n' "$FORMAT"
+            printf 'math      : %s dpi, %s background, remote %s\n' \
+                "$MATH_DPI" "$MATH_BG" "$( [ "$MATH_REMOTE_OK" = "1" ] && printf allowed || printf 'never')"
+            printf 'preamble  : %s\n' "${MATH_PREAMBLE:-none}"
+            printf 'network   : %ss timeout, %s retries\n' "$TIMEOUT" "$RETRIES"
+            printf 'run tail  : %s lines\n' "$RUN_TAIL" ;;
         *)
             die "$EX_USAGE" "'config' expects path, files or show" ;;
     esac
@@ -3084,7 +3177,11 @@ main() {
     [ $# -eq 0 ] && { usage; exit "$EX_USAGE"; }
     case "$1" in
         -h|--help|help|version|--version|cheatsheet|cheat|hook|hooks|completion) ;;
-        *) workdir_init ;;
+        *)
+            workdir_init
+            preparse_config_flags "$@"
+            load_file_settings
+            ;;
     esac
     case "$1" in
         send|msg|message)   shift; cmd_send "$@" ;;

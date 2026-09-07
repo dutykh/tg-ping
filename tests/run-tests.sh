@@ -314,6 +314,50 @@ if describe "safety: cooldown suppresses a repeat"; then
     fi
 fi
 
+if describe "config: .env.local supplies the namespaced keys only"; then
+    start_case
+    proj="$SANDBOX/proj-local"; mkdir -p "$proj"
+    # A file shared with other tools: the namespaced key is ours, the bare one is not.
+    printf 'TG_PING_TOKEN=222:localtoken\nTG_PING_CHAT_ID=777\nBOT_TOKEN=999:notours\nCHAT_ID=1\n' \
+        > "$proj/.env.local"
+    ( cd "$proj" && env -u TG_PING_TOKEN -u TG_PING_CHAT_ID -u TG_PING_NO_DOTENV \
+        TGP_CAPTURE="$CAPTURE" "$TG" "local env" >/dev/null 2>&1 )
+    if [ "$(field_value sendMessage chat_id)" = "777" ]; then
+        ok "config: .env.local supplies the namespaced keys only"
+    else
+        bad "config: .env.local supplies the namespaced keys only" "chat=$(field_value sendMessage chat_id)"
+    fi
+fi
+
+if describe "config: a bare BOT_TOKEN in .env.local is ignored"; then
+    start_case
+    proj="$SANDBOX/proj-bare"; mkdir -p "$proj"
+    printf 'BOT_TOKEN=999:notours\nCHAT_ID=1\n' > "$proj/.env.local"
+    out=$( cd "$proj" && env -u TG_PING_TOKEN -u TG_PING_CHAT_ID -u TG_PING_NO_DOTENV \
+        TGP_CAPTURE="$CAPTURE" "$TG" "should not send" 2>&1 )
+    rc=$?
+    if [ "$rc" -eq 3 ] && [ ! -f "$CAPTURE" ]; then
+        ok "config: a bare BOT_TOKEN in .env.local is ignored"
+    else
+        bad "config: a bare BOT_TOKEN in .env.local is ignored" "rc=$rc out=$out"
+    fi
+fi
+
+if describe "config: settings other than credentials come from the file"; then
+    start_case
+    proj="$SANDBOX/proj-settings"; mkdir -p "$proj"
+    printf 'TG_PING_TOKEN=1:x\nTG_PING_CHAT_ID=42\nTG_PING_FORMAT=plain\nTG_PING_TAIL=7\nTG_PING_MATH_DPI=600\n' \
+        > "$proj/.tg-ping.env"
+    out=$( cd "$proj" && env -u TG_PING_TOKEN -u TG_PING_CHAT_ID -u TG_PING_NO_DOTENV \
+        "$TG" config show 2>&1 )
+    if contains "$out" "format    : plain" && contains "$out" "run tail  : 7 lines" &&
+       contains "$out" "600 dpi"; then
+        ok "config: settings other than credentials come from the file"
+    else
+        bad "config: settings other than credentials come from the file" "$out"
+    fi
+fi
+
 # --- media -----------------------------------------------------------------
 if describe "media: a photo is uploaded"; then
     start_case
