@@ -8,6 +8,7 @@
 !.env.example
 /config
 *.token
+.env.local
 
 # Test and build leftovers
 /tmp/

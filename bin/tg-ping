@@ -176,9 +176,10 @@ is_number() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 #   2. environment variables
 #   3. --env-file FILE, or $TG_PING_ENV_FILE
 #   4. ./.tg-ping.env               (project local, read in full)
-#   5. ./.env                       (only TG_PING_* and TELEGRAM_* keys)
-#   6. $XDG_CONFIG_HOME/tg-ping/<profile>.env
-#   7. /etc/tg-ping/config
+#   5. ./.env.local                 (only TG_PING_* and TELEGRAM_* keys)
+#   6. ./.env                       (only TG_PING_* and TELEGRAM_* keys)
+#   7. $XDG_CONFIG_HOME/tg-ping/<profile>.env
+#   8. /etc/tg-ping/config
 #
 # Files are never sourced and never evaluated: a hand written reader accepts
 # KEY=VALUE lines only, so a hostile .env cannot execute anything.
@@ -206,7 +207,8 @@ config_files() {
     local dir; dir=$(config_dir)
     [ -n "$ENV_FILE" ] && printf '%s\n' "$ENV_FILE"
     if [ "${TG_PING_NO_DOTENV:-0}" != "1" ]; then
-        printf '%s\n' "./.tg-ping.env" "./.env"
+        # .env.local is preferred over .env (same convention as many app stacks).
+        printf '%s\n' "./.tg-ping.env" "./.env.local" "./.env"
     fi
     printf '%s\n' "$dir/${PROFILE}.env" "$dir/config.env" "$dir/config" "/etc/tg-ping/config"
 }
@@ -218,11 +220,13 @@ lookup_setting() {
         [ -n "$file" ] || continue
         [ -r "$file" ] || continue
         for key in "$@"; do
-            # A generic ./.env may hold unrelated secrets, so only the
+            # Generic dotenv files may hold unrelated secrets, so only the
             # namespaced keys are honoured there.
-            if [ "$file" = "./.env" ]; then
-                case "$key" in TG_PING_*|TELEGRAM_*) ;; *) continue ;; esac
-            fi
+            case "$file" in
+                ./.env|./.env.local)
+                    case "$key" in TG_PING_*|TELEGRAM_*) ;; *) continue ;; esac
+                    ;;
+            esac
             value=$(env_file_get "$file" "$key") || continue
             if [ -n "$value" ]; then
                 CONFIG_SOURCES="${CONFIG_SOURCES}${file} "
@@ -2845,9 +2849,10 @@ CONFIGURATION, first match wins
   2. environment: TG_PING_TOKEN, TG_PING_CHAT_ID
   3. --env-file FILE, or \$TG_PING_ENV_FILE
   4. ./.tg-ping.env
-  5. ./.env, restricted to TG_PING_* and TELEGRAM_* keys
-  6. $(config_dir)/<profile>.env
-  7. /etc/tg-ping/config
+  5. ./.env.local, restricted to TG_PING_* and TELEGRAM_* keys
+  6. ./.env, restricted to TG_PING_* and TELEGRAM_* keys
+  7. $(config_dir)/<profile>.env
+  8. /etc/tg-ping/config
   Files are parsed as KEY=VALUE, never sourced, never evaluated.
 
 ENVIRONMENT
@@ -2857,7 +2862,7 @@ ENVIRONMENT
   TG_PING_FORMAT                    default format, default auto
   TG_PING_DISABLED=1                turn every call into a silent no-op
   TG_PING_SOFT_FAIL=1               never fail a pipeline because of a notification
-  TG_PING_NO_DOTENV=1               ignore ./.env and ./.tg-ping.env
+  TG_PING_NO_DOTENV=1               ignore ./.env, ./.env.local and ./.tg-ping.env
   TG_PING_PROFILE                   profile name, default "default"
   TG_PING_MATH_REMOTE=1             allow the public LaTeX renderer as a fallback
 

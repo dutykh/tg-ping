@@ -169,9 +169,10 @@ wins:
 2. environment variables            TG_PING_TOKEN, TG_PING_CHAT_ID
 3. --env-file FILE                  or $TG_PING_ENV_FILE
 4. ./.tg-ping.env                   project local, read in full
-5. ./.env                           only TG_PING_* and TELEGRAM_* keys
-6. ~/.config/tg-ping/<profile>.env  written by 'tg-ping init'
-7. /etc/tg-ping/config              system wide
+5. ./.env.local                     only TG_PING_* and TELEGRAM_* keys
+6. ./.env                           only TG_PING_* and TELEGRAM_* keys
+7. ~/.config/tg-ping/<profile>.env  written by 'tg-ping init'
+8. /etc/tg-ping/config              system wide
 ```
 
 Configuration files are parsed as `KEY=VALUE`. They are never sourced and never

@@ -76,12 +76,16 @@ fi
 
 if [ "$NO_COMPLETION" -eq 0 ]; then
     user_comp="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"
-    if [ -w "$PREFIX/share" ] 2>/dev/null || mkdir -p "$COMP_DIR" 2>/dev/null; then
+    # Always mkdir the full completion path. "$PREFIX/share" being writable does
+    # not mean bash-completion/completions already exists underneath it.
+    if mkdir -p "$COMP_DIR" 2>/dev/null && [ -w "$COMP_DIR" ]; then
         "$TARGET" completion bash > "$COMP_DIR/tg-ping" 2>/dev/null &&
             say "bash completion installed in $COMP_DIR"
-    elif mkdir -p "$user_comp" 2>/dev/null; then
+    elif mkdir -p "$user_comp" 2>/dev/null && [ -w "$user_comp" ]; then
         "$TARGET" completion bash > "$user_comp/tg-ping" 2>/dev/null &&
             say "bash completion installed in $user_comp"
+    else
+        warn "could not install bash completion (no writable completions directory)"
     fi
 fi
 
