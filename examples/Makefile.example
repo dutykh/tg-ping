@@ -20,6 +20,6 @@ test:
 	@$(NOTIFY) run --label "test suite" --tail 30 -- pytest -q
 
 bench:
-	@$(NOTIFY) run --notify-start --label "benchmarks" --limit 7200 -- ./bench.sh
+	@$(NOTIFY) run --notify-start --label "benchmarks" --limit 2h --stall 20m -- ./bench.sh
 	@$(NOTIFY) table bench/results.csv --title "Benchmark results"
 	@$(NOTIFY) photo bench/timings.png --caption "Scaling with the number of cores"

@@ -52,8 +52,9 @@ tg-ping init
 ```
 
 It validates the token, lists every chat that has written to the bot, asks
-which one to use, writes `~/.config/tg-ping/default.env` with mode 600, and
-sends a confirmation message.
+which one to use, asks what this machine should be called in messages, writes
+`~/.config/tg-ping/default.env` with mode 600, and sends a confirmation
+message. The token is typed without echo and never printed afterwards.
 
 To do the same by hand:
 
@@ -106,19 +107,62 @@ export TG_PING_THREAD_ID=42
 
 The id appears in the link to the topic, as the number after the group id.
 
-## Several bots
+## Topics in the chat with your bot
 
-One bot per purpose keeps the chats readable, and is required if two processes
-must read updates at the same time (only one reader per bot is allowed by
-Telegram).
+Telegram also allows topics inside the private chat with a bot, made by the bot
+itself. With them, each project keeps its own thread on the phone, one per
+computer, named like `NLS-cavity · laptop`, instead of one long mixed stream.
+
+Topic mode belongs to the bot and is switched on once: in `@BotFather`, open
+the settings of your bot (`/mybots`, then the bot) and turn on **Threaded
+Mode**. Then check that Telegram reports it:
 
 ```bash
-tg-ping --profile cluster init
-tg-ping --profile laptop  init
+tg-ping doctor            # the "topics" line says whether topic mode is on
+tg-ping config set topics project
+```
+
+From then on every message goes to the topic of its project and its machine.
+The topic is made the first time the project sends something, made again if
+you delete it, and while topics cannot be used (topic mode off, or Telegram
+refusing them) messages go to the main chat, so nothing is lost. A message
+given its own `--topic` keeps it.
+
+## Several computers, one bot
+
+One bot can serve every computer you own, and that is the simplest setup: the
+same token and chat on each machine, and a different name for each, which then
+appears on every message ("✅ 💻 laptop · Tests green").
+
+```bash
+tg-ping init                                  # on each machine, same token
+tg-ping config set machine "office desktop"   # or name it later
+```
+
+The icon follows the kind of machine (💻 laptop, 🖥️ desktop, 🌐 server or
+virtual machine), detected once when the name is set. Questions asked from
+several computers at the same time are safe: each machine files the answers it
+reads for the question they belong to, and leaves those of the other machines
+for them to collect.
+
+## Several bots
+
+One bot per purpose keeps the chats readable, for instance one for the cluster
+and one for personal work:
+
+```bash
+tg-ping init --profile cluster
+tg-ping init --profile personal
 tg-ping --profile cluster --ok "the queue is empty"
 ```
 
-Each profile lives in its own file under `~/.config/tg-ping/`.
+Each profile lives in its own file under `~/.config/tg-ping/`. A project can
+choose its profile by naming it in its own folder, without ever holding the
+token:
+
+```bash
+echo 'TG_PING_PROFILE=cluster' > .tg-ping.env
+```
 
 ## If a token leaks
 

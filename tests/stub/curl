@@ -6,11 +6,35 @@
 #         Science and Technology, Abu Dhabi, UAE).
 #
 # It parses the configuration file that tg-ping writes, records the request in
-# $TGP_CAPTURE, and answers with canned Telegram JSON. Behaviour is steered by
+# $TGP_CAPTURE, and answers with Telegram JSON shaped like the real replies.
+# Behaviour is steered by
 #   TGP_STUB_DIR       directory holding <method>.response files
 #   TGP_STUB_HTTP      HTTP status to report (default 200)
-#   TGP_STUB_SCRIPT    file with one "status<TAB>body" line per attempt
+#   TGP_STUB_SCRIPT    file with one "status<TAB>body" line per call, any method
+#   TGP_STUB_QUEUE     directory holding <method> files of "status<TAB>body"
+#                      lines, consumed one per call of that method; a status of
+#                      000 stands for a network failure
+#   TGP_STUB_UPDATES   file of update templates, one JSON object per line,
+#                      served by getUpdates from the requested offset; see below
 #   TGP_STUB_ASK       echo the callback_data of the last keyboard back as an update
+#   TGP_STUB_SLOW      seconds to wait before answering any call
+#   TGP_STUB_CONFLICT  answer 409 when two getUpdates calls overlap
+#   TGP_STUB_WEBHOOK   answer every getUpdates with the webhook conflict
+#   TGP_STUB_TOPICS    report forum topic mode as enabled in getMe
+#
+# Every call is kept in $TGP_CAPTURE.d/calls/<n>.<method>.<field>, and the
+# fields of the last call of each method in $TGP_CAPTURE.d/<method>.<field>.
+# Messages get increasing ids from 4242; sent ones are listed, one per line,
+# in $TGP_CAPTURE.d/sent as "<call> <method> <message_id>".
+#
+# Update templates may use placeholders, and a template stays invisible until
+# every placeholder it uses can be resolved:
+#   {{mid:N}}    id of the N-th sent message (1-based)
+#   {{next:N}}   that id plus one, the message that follows it
+#   {{cb:N:K}}   callback_data of button K (0-based) of the N-th sent message
+#   {{poll:N}}   poll id of the N-th sent message
+#   {{now}}      the current time in seconds
+# A template without "update_id" gets 100 plus its line number.
 
 set -u
 
@@ -34,9 +58,26 @@ url=""; out=""; method=""
 fields_names=(); fields_values=(); uploads=()
 
 unquote() {
-    local v="$1"
+    # Undo the escaping of a double quoted curl configuration value.
+    local v="$1" res="" c n
     v=${v#\"}; v=${v%\"}
-    printf '%s' "$v"
+    while [ -n "$v" ]; do
+        c=${v:0:1}
+        if [ "$c" = "\\" ]; then
+            n=${v:1:1}
+            case "$n" in
+                t) res="$res"$'\t' ;;
+                n) res="$res"$'\n' ;;
+                r) res="$res"$'\r' ;;
+                *) res="$res$n" ;;
+            esac
+            v=${v:2}
+        else
+            res="$res$c"
+            v=${v:1}
+        fi
+    done
+    printf '%s' "$res"
 }
 
 while IFS= read -r line; do
@@ -64,28 +105,217 @@ done < "$cfg"
 
 method=${url##*/}
 
-if [ -n "${TGP_CAPTURE:-}" ]; then
-    {
-        printf 'METHOD\t%s\n' "$method"
-        i=0
-        while [ "$i" -lt "${#fields_names[@]}" ]; do
-            printf 'FIELD\t%s\t%s\n' "${fields_names[$i]}" \
-                "$(printf '%s' "${fields_values[$i]}" | awk 'BEGIN{ORS=""}{if(NR>1)printf "\\n"; print}')"
-            i=$(( i + 1 ))
-        done
-        for u in ${uploads[@]+"${uploads[@]}"}; do printf 'UPLOAD\t%s\n' "$u"; done
-        printf 'END\n'
-    } >> "$TGP_CAPTURE"
-    mkdir -p "$TGP_CAPTURE.d"
-    i=0
+field() {
+    # field NAME -> the value of a request field, empty when absent.
+    local i=0
     while [ "$i" -lt "${#fields_names[@]}" ]; do
-        printf '%s' "${fields_values[$i]}" > "$TGP_CAPTURE.d/${method}.${fields_names[$i]}"
+        if [ "${fields_names[$i]}" = "$1" ]; then
+            printf '%s' "${fields_values[$i]}"
+            return 0
+        fi
         i=$(( i + 1 ))
     done
-fi
+    return 1
+}
+
+D="${TGP_CAPTURE:-${TMPDIR:-/tmp}/tgp-stub.$$}.d"
+mkdir -p "$D/calls"
+
+with_lock() {
+    # with_lock COMMAND...: runs the command while holding the capture lock.
+    local tries=0
+    until mkdir "$D/lock" 2>/dev/null; do
+        tries=$(( tries + 1 ))
+        [ "$tries" -gt 500 ] && break
+        sleep 0.01
+    done
+    "$@"
+    rmdir "$D/lock" 2>/dev/null
+}
+
+# shellcheck disable=SC2329  # invoked through with_lock
+record_call() {
+    local n i
+    n=$(cat "$D/count" 2>/dev/null || echo 0)
+    n=$(( n + 1 ))
+    printf '%s' "$n" > "$D/count"
+    CALL_N="$n"
+    if [ -n "${TGP_CAPTURE:-}" ]; then
+        {
+            printf 'METHOD\t%s\n' "$method"
+            i=0
+            while [ "$i" -lt "${#fields_names[@]}" ]; do
+                printf 'FIELD\t%s\t%s\n' "${fields_names[$i]}" \
+                    "$(printf '%s' "${fields_values[$i]}" | awk 'BEGIN{ORS=""}{if(NR>1)printf "\\n"; print}')"
+                i=$(( i + 1 ))
+            done
+            for u in ${uploads[@]+"${uploads[@]}"}; do printf 'UPLOAD\t%s\n' "$u"; done
+            printf 'END\n'
+        } >> "$TGP_CAPTURE"
+    fi
+    i=0
+    while [ "$i" -lt "${#fields_names[@]}" ]; do
+        printf '%s' "${fields_values[$i]}" > "$D/${method}.${fields_names[$i]}"
+        printf '%s' "${fields_values[$i]}" > "$D/calls/${n}.${method}.${fields_names[$i]}"
+        i=$(( i + 1 ))
+    done
+    for u in ${uploads[@]+"${uploads[@]}"}; do
+        printf '%s\n' "$u" >> "$D/calls/${n}.${method}.uploads"
+    done
+    grep -v '^url = ' "$cfg" > "$D/calls/${n}.${method}.config" 2>/dev/null
+    # The public number of the bot (the token before its colon) and the server.
+    bot=${url#*/bot}; bot=${bot%%:*}
+    printf '%s' "$bot" > "$D/calls/${n}.${method}.bot"
+    printf '%s' "$bot" > "$D/${method}.bot"
+    printf '%s' "${url%%/bot*}" > "$D/${method}.server"
+}
+
+CALL_N=0
+with_lock record_call
+
+[ -n "${TGP_STUB_SLOW:-}" ] && sleep "$TGP_STUB_SLOW"
+
+next_mid() {
+    local m
+    m=$(cat "$D/mid" 2>/dev/null || echo 4241)
+    m=$(( m + 1 ))
+    printf '%s' "$m" > "$D/mid"
+    printf '%s' "$m"
+}
+
+json_str() {
+    # Quote a value as a JSON string, enough for the test data.
+    printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | awk 'BEGIN{ORS=""}{if(NR>1)printf "\\n"; print}')"
+}
+
+chat_json() {
+    local c
+    c=$(field chat_id || true)
+    case "$c" in
+        -[0-9]*|[0-9]*) printf '%s' "$c" ;;
+        *) printf '%s' "-100123" ;;
+    esac
+}
+
+message_json() {
+    # message_json ID -> a Message object for the current request.
+    local mid="$1" extra=""
+    if [ "$method" = "sendPoll" ]; then
+        extra=",\"poll\":{\"id\":\"poll-$mid\",\"question\":$(json_str "$(field question || true)")}"
+    fi
+    printf '{"message_id":%s,"chat":{"id":%s,"type":"private"},"date":%s%s}' \
+        "$mid" "$(chat_json)" "$(date +%s)" "$extra"
+}
+
+note_sent() {
+    printf '%s %s %s\n' "$CALL_N" "$method" "$1" >> "$D/sent"
+}
+
+default_reply() {
+    local mid n i body
+    case "$method" in
+        getMe)
+            if [ "${TGP_STUB_TOPICS:-0}" = "1" ]; then t=true; else t=false; fi
+            printf '{"ok":true,"result":{"id":123456789,"is_bot":true,"first_name":"Test Bot","username":"test_bot","has_topics_enabled":%s}}' "$t" ;;
+        getChat)
+            printf '{"ok":true,"result":{"id":%s,"type":"private","first_name":"Tester"}}' "$(chat_json)" ;;
+        getWebhookInfo)
+            printf '{"ok":true,"result":{"url":"","pending_update_count":0}}' ;;
+        createForumTopic)
+            n=$(cat "$D/topic" 2>/dev/null || echo 899); n=$(( n + 1 )); printf '%s' "$n" > "$D/topic"
+            printf '{"ok":true,"result":{"message_thread_id":%s,"name":%s,"icon_color":7322096}}' \
+                "$n" "$(json_str "$(field name || true)")" ;;
+        answerCallbackQuery|pinChatMessage|deleteMessage|setMessageReaction|unpinChatMessage)
+            printf '{"ok":true,"result":true}' ;;
+        editMessageText|editMessageCaption|editMessageMedia|editMessageReplyMarkup)
+            mid=$(field message_id || echo 4242)
+            printf '{"ok":true,"result":%s}' "$(message_json "$mid")" ;;
+        sendMediaGroup)
+            n=$(field media | grep -o '"type"' | wc -l | tr -d ' ')
+            [ "$n" -gt 0 ] || n=1
+            body="["; i=0
+            while [ "$i" -lt "$n" ]; do
+                mid=$(next_mid); note_sent "$mid"
+                [ "$i" -gt 0 ] && body="$body,"
+                body="$body$(message_json "$mid")"
+                i=$(( i + 1 ))
+            done
+            printf '{"ok":true,"result":%s]}' "$body" ;;
+        getUpdates)
+            printf '{"ok":true,"result":[]}' ;;
+        send*|copyMessage|forwardMessage)
+            mid=$(next_mid); note_sent "$mid"
+            printf '{"ok":true,"result":%s}' "$(message_json "$mid")" ;;
+        *)
+            printf '{"ok":true,"result":true}' ;;
+    esac
+}
+
+resolve_template() {
+    # resolve_template LINE -> the update with placeholders filled in, or
+    # nothing when a placeholder cannot be resolved yet.
+    local t="$1" ph kind a b val call kb
+    while :; do
+        case "$t" in
+            *'{{'*'}}'*) ;;
+            *) break ;;
+        esac
+        ph=${t#*\{\{}; ph=${ph%%\}\}*}
+        kind=${ph%%:*}
+        case "$kind" in
+            now) val=$(date +%s) ;;
+            mid|poll|next)
+                a=${ph#*:}
+                val=$(sed -n "${a}p" "$D/sent" 2>/dev/null | cut -d' ' -f3)
+                [ -n "$val" ] || return 0
+                [ "$kind" = "poll" ] && val="poll-$val"
+                [ "$kind" = "next" ] && val=$(( val + 1 )) ;;
+            cb)
+                a=${ph#cb:}; b=${a#*:}; a=${a%%:*}
+                call=$(sed -n "${a}p" "$D/sent" 2>/dev/null | cut -d' ' -f1,2 | tr ' ' '.')
+                [ -n "$call" ] || return 0
+                kb=$(cat "$D/calls/${call}.reply_markup" 2>/dev/null)
+                val=$(printf '%s' "$kb" | grep -o '"callback_data":"[^"]*"' | sed -n "$(( b + 1 ))p" | cut -d'"' -f4)
+                [ -n "$val" ] || return 0 ;;
+            *) return 0 ;;
+        esac
+        t="${t%%\{\{"$ph"\}\}*}${val}${t#*\{\{"$ph"\}\}}"
+    done
+    printf '%s' "$t"
+}
+
+updates_reply() {
+    local offset timeout n line uid body sep="" waited=0 t
+    offset=$(field offset || echo 0)
+    case "$offset" in ''|*[!0-9]*) offset=0 ;; esac
+    timeout=$(field timeout || echo 0)
+    case "$timeout" in ''|*[!0-9]*) timeout=0 ;; esac
+    while :; do
+        body="["; sep=""; n=0
+        while IFS= read -r line || [ -n "$line" ]; do
+            n=$(( n + 1 ))
+            [ -n "$line" ] || continue
+            t=$(resolve_template "$line")
+            [ -n "$t" ] || continue
+            case "$t" in
+                *'"update_id"'*) uid=$(printf '%s' "$t" | sed -n 's/.*"update_id":\([0-9]*\).*/\1/p') ;;
+                *) uid=$(( 100 + n )); t="{\"update_id\":$uid,${t#\{}" ;;
+            esac
+            [ "$uid" -ge "$offset" ] || continue
+            body="$body$sep$t"; sep=","
+        done < "$TGP_STUB_UPDATES"
+        body="$body]"
+        if [ "$body" != "[]" ] || [ "$waited" -ge 1 ] || [ "$timeout" -eq 0 ]; then
+            break
+        fi
+        sleep 0.3
+        waited=1
+    done
+    printf '{"ok":true,"result":%s}' "$body"
+}
 
 status="${TGP_STUB_HTTP:-200}"
-body='{"ok":true,"result":{"message_id":4242,"chat":{"id":-100123}}}'
+body=""
 
 if [ -n "${TGP_STUB_SCRIPT:-}" ] && [ -r "$TGP_STUB_SCRIPT" ]; then
     n=$(cat "${TGP_STUB_SCRIPT}.count" 2>/dev/null || echo 0)
@@ -96,21 +326,61 @@ if [ -n "${TGP_STUB_SCRIPT:-}" ] && [ -r "$TGP_STUB_SCRIPT" ]; then
         status=$(printf '%s' "$line" | cut -f1)
         body=$(printf '%s' "$line" | cut -f2-)
     fi
-elif [ -n "${TGP_STUB_DIR:-}" ] && [ -r "$TGP_STUB_DIR/$method.response" ]; then
+fi
+
+if [ -z "$body" ] && [ -n "${TGP_STUB_QUEUE:-}" ] && [ -r "$TGP_STUB_QUEUE/$method" ]; then
+    n=$(cat "$TGP_STUB_QUEUE/$method.n" 2>/dev/null || echo 0)
+    n=$(( n + 1 ))
+    printf '%s' "$n" > "$TGP_STUB_QUEUE/$method.n"
+    line=$(sed -n "${n}p" "$TGP_STUB_QUEUE/$method")
+    if [ -n "$line" ]; then
+        status=$(printf '%s' "$line" | cut -f1)
+        body=$(printf '%s' "$line" | cut -f2-)
+    fi
+fi
+
+if [ -z "$body" ] && [ -n "${TGP_STUB_DIR:-}" ] && [ -r "$TGP_STUB_DIR/$method.response" ]; then
     body=$(cat "$TGP_STUB_DIR/$method.response")
 fi
 
-if [ "$method" = "getUpdates" ] && [ "${TGP_STUB_ASK:-0}" = "1" ]; then
-    data=$(grep -o '"callback_data":"[^"]*"' "$TGP_CAPTURE.d/sendMessage.reply_markup" 2>/dev/null |
-           head -n1 | cut -d'"' -f4)
-    if [ -n "$data" ]; then
-        body='{"ok":true,"result":[{"update_id":10,"callback_query":{"id":"cb1","from":{"id":77},"message":{"message_id":4242,"chat":{"id":-100123}},"data":"'"$data"'"}}]}'
-        : > "$TGP_CAPTURE.d/sendMessage.reply_markup"
+if [ "$status" = "000" ]; then
+    printf 'curl: (7) Failed to connect to api.telegram.org port 443\n' >&2
+    printf '000'
+    exit 7
+fi
+
+if [ "$method" = "getUpdates" ] && [ -z "$body" ]; then
+    if [ "${TGP_STUB_WEBHOOK:-0}" = "1" ]; then
+        status=409
+        body='{"ok":false,"error_code":409,"description":"Conflict: can'"'"'t use getUpdates method while webhook is active; use deleteWebhook to delete the webhook first"}'
+    elif [ "${TGP_STUB_CONFLICT:-0}" = "1" ] && ! mkdir "$D/getupdates" 2>/dev/null; then
+        status=409
+        body='{"ok":false,"error_code":409,"description":"Conflict: terminated by other getUpdates request; make sure that only one bot instance is running"}'
     else
-        body='{"ok":true,"result":[]}'
+        [ "${TGP_STUB_CONFLICT:-0}" = "1" ] && trap 'rmdir "$D/getupdates" 2>/dev/null' EXIT
+        if [ -n "${TGP_STUB_UPDATES:-}" ] && [ -r "$TGP_STUB_UPDATES" ]; then
+            body=$(updates_reply)
+        elif [ "${TGP_STUB_ASK:-0}" = "1" ]; then
+            data=$(grep -o '"callback_data":"[^"]*"' "$D/sendMessage.reply_markup" 2>/dev/null |
+                   head -n1 | cut -d'"' -f4)
+            if [ -n "$data" ]; then
+                mid=$(cat "$D/mid" 2>/dev/null || echo 4242)
+                body='{"ok":true,"result":[{"update_id":10,"callback_query":{"id":"cb1","from":{"id":77},"message":{"message_id":'"$mid"',"chat":{"id":-100123},"date":'"$(date +%s)"'},"data":"'"$data"'"}}]}'
+                : > "$D/sendMessage.reply_markup"
+            else
+                body='{"ok":true,"result":[]}'
+            fi
+        fi
     fi
+fi
+
+if [ -z "$body" ]; then
+    case "$status" in
+        2*) body=$(default_reply) ;;
+        *)  body='{"ok":false,"error_code":'"$status"',"description":"stub error"}' ;;
+    esac
 fi
 
 [ -n "$out" ] && printf '%s' "$body" > "$out"
 printf '%s' "$status"
-case "$status" in 2*) exit 0 ;; *) exit 22 ;; esac
+exit 0

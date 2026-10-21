@@ -36,11 +36,48 @@ jobs:
           bin/tg-ping cheatsheet
           bin/tg-ping hook claude
 
-  tests-without-jq:
+  macos-bash-3-2:
+    # The bash that macOS ships (3.2), with the BSD tools and the system awk,
+    # and without flock or timeout, so that the fallbacks are exercised.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Put /bin/bash first on PATH
+        run: |
+          mkdir -p "$RUNNER_TEMP/oldbash"
+          ln -s /bin/bash "$RUNNER_TEMP/oldbash/bash"
+          echo "$RUNNER_TEMP/oldbash" >> "$GITHUB_PATH"
+      - name: Run the offline test suite under bash 3.2
+        run: |
+          bash --version | head -n1
+          /bin/bash tests/run-tests.sh
+
+  awk-variants:
+    # Every count and cut of a text is made in awk, so each common awk runs
+    # the whole suite.
+    strategy:
+      fail-fast: false
+      matrix:
+        awk: [mawk, gawk, "busybox awk"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the awk programs
+        run: sudo apt-get update && sudo apt-get install -y mawk gawk busybox
+      - name: Run the offline test suite
+        env:
+          TG_PING_AWK: ${{ matrix.awk }}
+        run: tests/run-tests.sh
+
+  tests-without-json-readers:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Remove jq to exercise the fallback reader
         run: sudo rm -f "$(command -v jq)"
-      - name: Run the offline test suite
+      - name: Run the offline test suite without jq
+        run: tests/run-tests.sh
+      - name: Run it again with neither jq nor python3
+        env:
+          TG_PING_HIDE: "jq python3"
         run: tests/run-tests.sh

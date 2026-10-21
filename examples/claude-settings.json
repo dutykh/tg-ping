@@ -1,12 +1,12 @@
 {
-  "_comment": "Claude Code hooks for tg-ping. Copy into .claude/settings.json, or merge the hooks block into an existing file. Author: Dr. Denys Dutykh (Mathematics Department, Khalifa University of Science and Technology, Abu Dhabi, UAE).",
+  "_comment": "Claude Code hooks for tg-ping. Copy into .claude/settings.json, or merge the hooks block into an existing file. Claude Code hands each hook a JSON document on stdin, which --no-stdin leaves unread. Author: Dr. Denys Dutykh (Mathematics Department, Khalifa University of Science and Technology, Abu Dhabi, UAE).",
   "hooks": {
     "Stop": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "tg-ping --ok --title \"Claude finished\" --meta --cooldown 60 --key claude-stop \"Session ended in $(basename \"$PWD\")\""
+            "command": "tg-ping --no-stdin --ok --title \"Claude finished\" --cooldown 60 --key claude-stop --meta \"Session ended in $(basename \"$PWD\")\""
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "tg-ping --level question --title \"Claude needs you\" --meta \"Waiting in $(basename \"$PWD\")\""
+            "command": "tg-ping --no-stdin --level question --title \"Claude needs you\" --meta \"Waiting in $(basename \"$PWD\")\""
           }
         ]
       }

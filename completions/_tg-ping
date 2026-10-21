@@ -1,31 +1,62 @@
 #compdef tg-ping
-# Zsh completion for tg-ping.
+# Zsh completion for tg-ping, made by 'tg-ping completion zsh'.
 # Author: Dr. Denys Dutykh (Mathematics Department, Khalifa University of
 #         Science and Technology, Abu Dhabi, UAE).
-#compdef tg-ping
+
 _tg_ping() {
-    local -a commands
+    local -a commands options profiles
     commands=(
         'send:send a text message'
-        'code:send a snippet or file as a code block'
-        'table:send aligned CSV or TSV rows'
-        'math:typeset a formula and send it as an image'
-        'photo:send images, several become an album'
-        'file:send a document'
+        'code:send a snippet or a file as a code block'
+        'table:send CSV or TSV rows as an aligned table'
+        'math:typeset a formula and send it as a picture'
+        'photo:send pictures, several of them as an album'
+        'file:send documents'
         'media:send up to ten files as one album'
-        'run:run a command and report the outcome'
-        'progress:keep one message updated in place'
+        'pdf:send pages of a PDF as pictures'
+        'rich:send a Markdown report as one rich message'
+        'run:run a command and report how it ended'
+        'progress:keep one message up to date'
+        'wait:report when a running process ends'
         'ask:ask a question and wait for the answer'
-        'poll:send a native poll'
-        'init:interactive setup'
+        'poll:send a poll'
+        'edit:correct a message already sent'
+        'delete:withdraw a message already sent'
+        'init:set up the bot and the chat'
         'doctor:check the installation'
-        'chats:list known chat ids'
-        'config:show the active configuration'
-        'hook:print integration snippets'
-        'cheatsheet:one screen reference'
-        'completion:print shell completion'
+        'chats:list the chats that wrote to the bot'
+        'config:show or change the settings'
+        'hook:print snippets for agents and scripts'
+        'cheatsheet:print a one-screen reference'
+        'completion:print the shell completion'
+        'version:print the version'
+        'help:help on a command'
     )
-    if (( CURRENT == 2 )); then
+    options=(--anonymous --api --as --attach --attach-log --attach-log-always --background --bg --blocked --button --caption --chat --code --code-file --collapse --cols --config --cooldown --correct --debug --default --disabled --display --dpi --dry-run --each --edit-only --emoji --env-file --error --every --exit-zero --expected --fail --field --file --format --free-text --help --html --id --info --inline --insecure --item --json --key --label --lang --language --last --latex --level --limit --log --markdown --math --max-parts --md --message --meta --multi --name --native --no-fallback --no-header --no-machine --no-meta --no-preview --no-stdin --notify-start --ok --on --option --original --out --pages --partial --percent --pin --plain --preamble --prefix --preview --profile --prose --protect --quiet --quiet-output --quote --quote-file --remote --replace --reply-to --retries --rich --sep --separator --silent --soft-fail --stall --start --strict --success --tail --tee --text --thread --timeout --title --token --token-file --topic --truncate --typst --verbose --version --wait --warn --warning)
+    case "${words[CURRENT-1]}" in
+        --level|-L) compadd -- start info success warn error partial blocked question progress debug math; return ;;
+        --format) compadd -- auto rich html markdown plain; return ;;
+        --as) compadd -- auto photo video audio animation document; return ;;
+        --bg|--background) compadd -- white transparent dark; return ;;
+        --on) compadd -- always success failure never; return ;;
+        --profile|-P)
+            profiles=(${XDG_CONFIG_HOME:-$HOME/.config}/tg-ping/*.env(N:t:r))
+            compadd -a profiles; return ;;
+        --code-file|--quote-file|--out|--preamble|--env-file|--config|--token-file|--file|--log) _files; return ;;
+        -m|--message|--text|-t|--title|--emoji|--item|--field|--code|--lang|--language|--quote|--percent|--button|--cols|--option|-o|--prefix|--reply-to|--topic|--thread|--chat|-c|--token|--api|--timeout|--retries|--cooldown|--key|--id|--max-parts|--caption|--name|--dpi|--sep|--separator|--wait|--default|--correct|--each|--math|--pages|--expected|--label|-l|--tail|--limit|--every|--stall) return ;;
+    esac
+    if (( CURRENT == 3 )); then
+        case "${words[2]}" in
+            hook|hooks) compadd -- claude codex hooks bash make actions systemd python; return ;;
+            progress) compadd -- start update done; return ;;
+            config) compadd -- show set unset path files; return ;;
+            completion) compadd -- bash zsh; return ;;
+            help) _describe 'command' commands; return ;;
+        esac
+    fi
+    if [[ "$PREFIX" == -* ]]; then
+        compadd -a options
+    elif (( CURRENT == 2 )); then
         _describe 'command' commands
     else
         _files

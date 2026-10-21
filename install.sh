@@ -8,7 +8,7 @@
 # Usage:
 #   ./install.sh                     install into ~/.local/bin
 #   ./install.sh --prefix /usr/local install into /usr/local/bin (needs sudo)
-#   ./install.sh --uninstall         remove the command and its completion
+#   ./install.sh --uninstall         remove the command and its completions
 #   curl -fsSL https://raw.githubusercontent.com/dutykh/tg-ping/main/install.sh | bash
 
 set -euo pipefail
@@ -18,42 +18,66 @@ PREFIX="${PREFIX:-$HOME/.local}"
 UNINSTALL=0
 NO_COMPLETION=0
 
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'install.sh: %s\n' "$*" >&2; }
+die()  { printf 'install.sh: error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOS'
+Installer for tg-ping.
+
+  ./install.sh                     install into ~/.local/bin
+  ./install.sh --prefix /usr/local install into /usr/local/bin (needs sudo)
+  ./install.sh --uninstall         remove the command and its completions
+  ./install.sh --no-completion     skip the bash and zsh completions
+  curl -fsSL https://raw.githubusercontent.com/dutykh/tg-ping/main/install.sh | bash
+EOS
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
-        --prefix)         PREFIX="$2"; shift 2 ;;
+        --prefix)
+            [ $# -ge 2 ] || die "--prefix needs a folder, for example: --prefix /usr/local"
+            PREFIX="$2"; shift 2 ;;
         --uninstall)      UNINSTALL=1; shift ;;
         --no-completion)  NO_COMPLETION=1; shift ;;
-        -h|--help)
-            sed -n '3,12p' "$0" | sed -e 's/^# \{0,1\}//'
-            exit 0 ;;
-        *) printf 'install.sh: unknown option: %s\n' "$1" >&2; exit 2 ;;
+        -h|--help)        usage; exit 0 ;;
+        *) die "unknown option: $1 (see --help)" ;;
     esac
 done
 
 BIN_DIR="$PREFIX/bin"
 COMP_DIR="$PREFIX/share/bash-completion/completions"
+ZSH_DIR="$PREFIX/share/zsh/site-functions"
 TARGET="$BIN_DIR/tg-ping"
-SOURCE_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo "")
 
-say()  { printf '%s\n' "$*"; }
-warn() { printf 'install.sh: %s\n' "$*" >&2; }
-die()  { printf 'install.sh: error: %s\n' "$*" >&2; exit 1; }
+# A checkout is used only when this script runs from a file inside it. Piped
+# into bash, the script has no file, and the current folder must not be
+# mistaken for a checkout: the program is downloaded instead.
+SOURCE_DIR=""
+script="${BASH_SOURCE[0]:-}"
+if [ -n "$script" ] && [ -f "$script" ]; then
+    SOURCE_DIR=$(cd "$(dirname "$script")" && pwd)
+fi
 
 if [ "$UNINSTALL" -eq 1 ]; then
     removed=0
-    for candidate in "$TARGET" "$HOME/.local/bin/tg-ping" "/usr/local/bin/tg-ping"; do
-        if [ -f "$candidate" ]; then
-            rm -f "$candidate" && say "removed $candidate" && removed=1
-        fi
+    if [ -f "$TARGET" ]; then
+        rm -f "$TARGET" && say "removed $TARGET" && removed=1
+    fi
+    for candidate in "$COMP_DIR/tg-ping" "$ZSH_DIR/_tg-ping"; do
+        if [ -f "$candidate" ]; then rm -f "$candidate" && say "removed $candidate"; fi
     done
-    for candidate in "$COMP_DIR/tg-ping" \
-                     "${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/tg-ping"; do
-        [ -f "$candidate" ] && rm -f "$candidate" && say "removed $candidate"
-    done
-    [ "$removed" -eq 1 ] || warn "nothing to remove"
+    # The completion in the user's own folder serves whichever tg-ping is on
+    # the PATH: it goes only when none is left.
+    user_comp="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/tg-ping"
+    if [ "$removed" -eq 1 ] && [ -f "$user_comp" ] && ! command -v tg-ping >/dev/null 2>&1; then
+        rm -f "$user_comp" && say "removed $user_comp"
+    fi
+    [ "$removed" -eq 1 ] || warn "no tg-ping found in $BIN_DIR"
     say ""
-    say "The configuration in ${XDG_CONFIG_HOME:-$HOME/.config}/tg-ping was kept."
-    say "Delete it by hand if you also want the credentials gone."
+    say "The settings in ${XDG_CONFIG_HOME:-$HOME/.config}/tg-ping were kept."
+    say "Delete them by hand if you also want the credentials gone."
     exit 0
 fi
 
@@ -67,9 +91,16 @@ if [ -n "$SOURCE_DIR" ] && [ -f "$SOURCE_DIR/bin/tg-ping" ]; then
     say "installed $TARGET from this checkout"
 else
     say "downloading tg-ping from $REPO_RAW"
-    curl -fsSL "$REPO_RAW/bin/tg-ping" -o "$TARGET.tmp" || die "download failed"
-    head -n1 "$TARGET.tmp" | grep -q '^#!/usr/bin/env bash' || die "the downloaded file does not look like tg-ping"
-    mv "$TARGET.tmp" "$TARGET"
+    tmp="$TARGET.tmp.$$"
+    if ! curl -fsSL "$REPO_RAW/bin/tg-ping" -o "$tmp"; then
+        rm -f "$tmp"
+        die "download failed"
+    fi
+    if ! head -n1 "$tmp" | grep -q '^#!/usr/bin/env bash'; then
+        rm -f "$tmp"
+        die "the downloaded file does not look like tg-ping"
+    fi
+    mv "$tmp" "$TARGET"
     chmod 0755 "$TARGET"
     say "installed $TARGET"
 fi
@@ -85,7 +116,11 @@ if [ "$NO_COMPLETION" -eq 0 ]; then
         "$TARGET" completion bash > "$user_comp/tg-ping" 2>/dev/null &&
             say "bash completion installed in $user_comp"
     else
-        warn "could not install bash completion (no writable completions directory)"
+        warn "could not install the bash completion (no writable completions folder)"
+    fi
+    if mkdir -p "$ZSH_DIR" 2>/dev/null && [ -w "$ZSH_DIR" ]; then
+        "$TARGET" completion zsh > "$ZSH_DIR/_tg-ping" 2>/dev/null &&
+            say "zsh completion installed in $ZSH_DIR (add it to fpath if zsh does not see it)"
     fi
 fi
 
@@ -95,13 +130,14 @@ case ":$PATH:" in
         say ""
         warn "$BIN_DIR is not on your PATH."
         say "Add it with:"
-        say "    echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc"
+        say "    echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.bashrc"
         say "    source ~/.bashrc"
         ;;
 esac
 
 say ""
 say "Next steps:"
-say "    tg-ping init      create the bot configuration"
-say "    tg-ping doctor    check that everything works"
-say "    tg-ping 'hello'   send your first message"
+say "    tg-ping init                        create the bot settings"
+say "    tg-ping config set machine laptop   name this machine in every message"
+say "    tg-ping doctor                      check that everything works"
+say "    tg-ping 'hello'                     send your first message"
