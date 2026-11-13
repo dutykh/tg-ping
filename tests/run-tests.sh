@@ -2056,7 +2056,9 @@ if describe "receive: a file sent before the wait began is still taken"; then
     printf '%s\n' '{"message":{"message_id":6003,'"$CHAT_JSON"',"from":{"id":77},"date":{{now}},"document":{"file_id":"doc-3","file_name":"earlier.txt","mime_type":"text/plain","file_size":12}}}' \
         > "$SANDBOX/updates"
     export TGP_STUB_UPDATES="$SANDBOX/updates"
-    "$TG" ask "Anyone?" -o yes --wait 1 >/dev/null 2>&1
+    # The question must read the queue at least once, which a one second
+    # wait on a slow machine does not guarantee.
+    "$TG" ask "Anyone?" -o yes --wait 4 >/dev/null 2>&1
     held=$(ls "$TG_PING_STATE_DIR"/bot.*/held/ 2>/dev/null)
     out=$("$TG" receive --wait 5 --out "$SANDBOX/in" 2>/dev/null); RC=$?
     if [ "$held" = "101" ] && [ "$RC" -eq 0 ] && [ "$out" = "$SANDBOX/in/earlier.txt" ] &&
