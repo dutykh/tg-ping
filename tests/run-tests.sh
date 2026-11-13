@@ -2105,6 +2105,61 @@ fi
 fi   # files need a JSON reader
 unset TGP_STUB_UPDATES
 
+# --- the project on every message (2.1) ----------------------------------------
+if command -v git >/dev/null 2>&1; then
+    git init -q "$SANDBOX/repo" 2>/dev/null
+    mkdir -p "$SANDBOX/repo/Proofs/Zipf"
+fi
+
+if describe "project: every message ends with its folder inside the repository"; then
+    start_case
+    if [ -d "$SANDBOX/repo/.git" ]; then
+        ( cd "$SANDBOX/repo/Proofs/Zipf" && TG_PING_PROJECT=on TGP_CAPTURE="$CAPTURE" "$TG" --ok --title "Tests green" "142 passed" >/dev/null 2>&1 )
+        first=$(field_value sendMessage text)
+        ( cd "$SANDBOX/repo" && TG_PING_PROJECT=on TGP_CAPTURE="$CAPTURE" "$TG" --rich --title "R" "body" >/dev/null 2>&1 )
+        if contains "$first" "142 passed
+
+<i>📂 repo/Proofs/Zipf</i>" && contains "$(field_value sendRichMessage rich_message)" '<footer><i>📂 repo</i></footer>'; then
+            ok "project: every message ends with its folder inside the repository"
+        else
+            bad "project: every message ends with its folder inside the repository" "$first / $(field_value sendRichMessage rich_message)"
+        fi
+    else
+        SKIP=$((SKIP+1))
+    fi
+fi
+
+if describe "project: a name of the folder's own, and --no-meta hides it"; then
+    start_case
+    proj="$SANDBOX/proj-named"; mkdir -p "$proj"
+    printf 'TG_PING_PROJECT="Zipf paper"\n' > "$proj/.tg-ping.env"
+    ( cd "$proj" && env -u TG_PING_NO_DOTENV TGP_CAPTURE="$CAPTURE" "$TG" "named" >/dev/null 2>&1 )
+    first=$(field_value sendMessage text)
+    ( cd "$proj" && env -u TG_PING_NO_DOTENV TGP_CAPTURE="$CAPTURE" "$TG" --no-meta "hidden" >/dev/null 2>&1 )
+    second=$(field_value sendMessage text)
+    if contains "$first" "<i>📂 Zipf paper</i>" && [ "$second" = "hidden" ]; then
+        ok "project: a name of the folder's own, and --no-meta hides it"
+    else
+        bad "project: a name of the folder's own, and --no-meta hides it" "$first / $second"
+    fi
+fi
+
+if describe "project: config set project on, and the footer of --meta carries it"; then
+    start_case
+    "$TG" config set project on >/dev/null 2>&1
+    file="$XDG_CONFIG_HOME/tg-ping/default.env"
+    ( cd "$SANDBOX/proj-named" && TG_PING_PROJECT="my own name" "$TG" --meta "footer" >/dev/null 2>&1 )
+    text=$(field_value sendMessage text)
+    out=$("$TG" config show 2>&1)
+    if grep -q '^TG_PING_PROJECT=on$' "$file" && contains "$text" "$(date '+%Y-%m-%d')" &&
+       contains "$text" "· 📂 my own name</i>" && contains "$out" "project   : "; then
+        ok "project: config set project on, and the footer of --meta carries it"
+    else
+        bad "project: config set project on, and the footer of --meta carries it" "$(cat "$file" 2>/dev/null) / $text / $out"
+    fi
+    rm -f "$file"
+fi
+
 # --- help ------------------------------------------------------------------
 if describe "help: --help documents every command"; then
     start_case

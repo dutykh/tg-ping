@@ -55,6 +55,16 @@ found in a reading of the whole program are repaired first.
 * The option `--reply-to last` makes a message answer the last one this
   project sent.
 
+### Which project is speaking
+
+* With `TG_PING_PROJECT=on` (`config set project on`), every message ends
+  with the project it comes from, the folder inside its git repository
+  (`📂 typst-vault/Proofs/Zipf`) or the folder relative to home, so that
+  the reports of several agents working on one machine can be told apart;
+  a folder may give its own name in its `./.tg-ping.env`, the footer of
+  `--meta` gains the field `project`, and `--no-meta` leaves it out of one
+  message.
+
 ### Files from the phone
 
 * The command `receive` waits for a file sent to the bot (a photo, a

@@ -25,7 +25,10 @@ If an agent runs in a container or on a remote machine, put the credentials in
 the environment of that machine (`TG_PING_TOKEN`, `TG_PING_CHAT_ID`) rather
 than into the repository, and give the machine a name
 (`tg-ping config set machine "cluster"`, or `TG_PING_MACHINE`), so that you
-know which one is speaking.
+know which one is speaking. When several agents work on one machine, each in
+its own folder, `tg-ping config set project on` ends every message with the
+project it comes from (the folder inside its repository), so that you also
+know which one.
 
 ## What to write in the project instructions
 

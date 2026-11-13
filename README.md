@@ -35,6 +35,7 @@ file=$(tg-ping receive "Please send the referee's PDF" --wait 15m --out inbox/)
 * [Creating the Telegram bot](#creating-the-telegram-bot)
 * [Configuration](#configuration)
 * [Which machine is speaking](#which-machine-is-speaking)
+* [Which project is speaking](#which-project-is-speaking)
 * [A topic per project](#a-topic-per-project)
 * [Everyday use](#everyday-use)
 * [Message anatomy](#message-anatomy)
@@ -256,11 +257,12 @@ command line, in that increasing order of priority.
 | `TG_PING_CHAT_ID` | target chat, or a comma separated list of them | required |
 | `TG_PING_MACHINE` | the name of this machine, shown on every message | none |
 | `TG_PING_MACHINE_ICON` | its icon, recorded by `config set machine` | detected |
+| `TG_PING_PROJECT` | `on` to end every message with its project, or a name of your own | off |
 | `TG_PING_TOPICS` | `project` for one topic per project and machine | off |
 | `TG_PING_QUIET_HOURS` | hours without sound, such as `23-08` | none |
 | `TG_PING_THREAD_ID` | forum topic inside a group | none |
 | `TG_PING_PREFIX` | fixed label in front of every message | none |
-| `TG_PING_META` | fields of the `--meta` footer: `host`, `repo`, `time` | all three |
+| `TG_PING_META` | fields of the `--meta` footer: `host`, `repo`, `project`, `time` | `host,repo,time` |
 | `TG_PING_FORMAT` | `auto`, `rich`, `plain`, `markdown` or `html` | `auto` |
 | `TG_PING_TAIL` | log lines carried by a failed `run` | `20` |
 | `TG_PING_MAX_PARTS` | parts a long message may be split into | `8` |
@@ -363,6 +365,30 @@ icon and the host name, and `--no-machine` leaves the name out of one message.
 Host names are a poor guide (two of your machines may share one), which is why
 the name is chosen rather than read.
 
+## Which project is speaking
+
+Several agents may report from one machine at the same time, each from its
+own folder. With `TG_PING_PROJECT=on`, every message ends with the project
+it comes from: the folder inside its git repository (`📂 typst-vault/Proofs/Zipf`,
+or `📂 tg-ping` at the root of one), or the folder relative to your home
+outside any repository (`📂 ~/Dropbox/iPad`):
+
+```bash
+tg-ping config set project on
+```
+
+```text
+✅ 🖥️ office desktop · Tests green
+142 passed in 38 s
+
+📂 typst-vault/Proofs/Zipf
+```
+
+A folder may choose its own name in its `./.tg-ping.env`
+(`TG_PING_PROJECT="Zipf paper"`), the field `project` may also be listed in
+`TG_PING_META` for the footer of `--meta`, and `--no-meta` leaves the footer
+out of one message.
+
 ## A topic per project
 
 Telegram can keep topics inside the private chat with a bot. With
@@ -449,6 +475,7 @@ Every part is optional and they combine in a fixed order:
  collapsible quotation               --quote, --collapse
  code block                          --code, --code-file, --lang
  host · repo@branch · timestamp      --meta, fields chosen by TG_PING_META
+ 📂 project                          every message, with TG_PING_PROJECT=on
  [ button ] [ button ]               --button "Label=https://url"
 ```
 
@@ -938,7 +965,7 @@ TG_PING_HIDE="jq python3" tests/run-tests.sh
 shellcheck -x bin/tg-ping install.sh tests/run-tests.sh tests/stub/curl
 ```
 
-The 165 cases cover the settings and their scopes, the safety of the parser
+The 168 cases cover the settings and their scopes, the safety of the parser
 against a hostile file, the command word found after options, escaping and
 emphasis, the splitting of long messages and captions in every awk, the
 fallbacks of markup, captions, rich messages and topics, media of every kind,

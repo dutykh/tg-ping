@@ -220,7 +220,10 @@ git_context() {
     have git || return 0
     root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
     [ -n "$root" ] || return 0
-    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+    # The branch, or the commit when detached, or the branch to be of a
+    # repository without commits yet.
+    branch=$(git symbolic-ref --short -q HEAD 2>/dev/null) ||
+        branch=$(git rev-parse --short HEAD 2>/dev/null) || branch="?"
     printf '%s@%s' "$(basename "$root")" "$branch"
 }
 
@@ -582,6 +585,7 @@ load_file_settings() {
     _from_file TG_PING_QUIET_HOURS TG_PING_QUIET_HOURS && QUIET_HOURS="$v"
     _from_file TG_PING_META        TG_PING_META        && META_FIELDS=$(lc "$v")
     _from_file TG_PING_TOPICS      TG_PING_TOPICS      && TOPICS_MODE=$(lc "$v")
+    _from_file TG_PING_PROJECT     TG_PING_PROJECT     && PROJECT_MODE="$v"
     return 0
 }
 
@@ -1854,18 +1858,60 @@ MACHINE="${TG_PING_MACHINE:-}"; MACHINE_ICON="${TG_PING_MACHINE_ICON:-}"; SHOW_M
 QUIET_HOURS="${TG_PING_QUIET_HOURS:-}"
 META_FIELDS=$(lc "${TG_PING_META:-host,repo,time}")
 TOPICS_MODE=$(lc "${TG_PING_TOPICS:-}")
+PROJECT_MODE="${TG_PING_PROJECT:-}"
 DELIVER_SUPPRESSED=0; NO_BUTTONS=0; KEYBOARD_FORCE_REPLY=0; PROGRESS_INFO=""; MATH_AS_CODE=0
 RICH_MEDIA_JSON=""; RICH_FILES=(); RICH_KIND="html"; RICH_EXTRA=""
 
+project_shown() {
+    # True when every message ends with the project it comes from
+    # (TG_PING_PROJECT on, or a name of the project's own).
+    case "$(lc "$PROJECT_MODE")" in ""|off|0|false|no|n) return 1 ;; esac
+    return 0
+}
+
+project_label() {
+    # The project a message comes from, for its footer: the name
+    # TG_PING_PROJECT gives when it is not a switch, else the folder inside
+    # its git repository ("typst-vault/Proofs/Zipf", "tg-ping" at the root
+    # of one), or the folder relative to home outside a repository
+    # ("~/Dropbox/iPad"), so that the reports of several agents working on
+    # one machine can be told apart.
+    local root here rel
+    case "$(lc "$PROJECT_MODE")" in
+        ""|on|1|true|yes|y|auto) ;;
+        *) printf '%s' "$PROJECT_MODE"; return 0 ;;
+    esac
+    here=$(pwd -P 2>/dev/null) || here="$PWD"
+    root=$(git rev-parse --show-toplevel 2>/dev/null) || root=""
+    if [ -n "$root" ]; then
+        rel=${here#"$root"}; rel=${rel#/}
+        printf '%s%s' "$(basename "$root")" "${rel:+/$rel}"
+        return 0
+    fi
+    # shellcheck disable=SC2088  # the tilde is printed, not expanded
+    case "$here" in
+        "$HOME")   printf '~' ;;
+        "$HOME"/*) printf '~/%s' "${here#"$HOME"/}" ;;
+        *)         printf '%s' "$here" ;;
+    esac
+}
+
 meta_line() {
     # The footer of --meta, with the fields TG_PING_META chooses among host
-    # (the machine), repo (repository and branch) and time.
-    local field out="" ctx
-    for field in $(printf '%s' "$META_FIELDS" | tr ',' ' '); do
+    # (the machine), repo (repository and branch), project (the folder, see
+    # project_label) and time. With TG_PING_PROJECT on, the project is in
+    # every footer, and is the whole footer of a message sent without --meta.
+    local fields="$META_FIELDS" field out="" ctx
+    if project_shown; then
+        [ "$META" -eq 1 ] || fields="project"
+        case ",$fields," in *,project,*|*,folder,*|*,dir,*) ;; *) fields="$fields,project" ;; esac
+    fi
+    for field in $(printf '%s' "$fields" | tr ',' ' '); do
         case "$field" in
             host|machine)
                 if [ -n "$(machine_tag)" ]; then out="$out · $(machine_tag)"; else out="$out · $(host_name)"; fi ;;
             repo|git)     ctx=$(git_context); [ -n "$ctx" ] && out="$out · $ctx" ;;
+            project|folder|dir) out="$out · 📂 $(project_label)" ;;
             time|date)    out="$out · $(date '+%Y-%m-%d %H:%M %Z')" ;;
         esac
     done
@@ -1921,7 +1967,9 @@ build_message_rich() {
             i=$(( i + 1 ))
         done
     fi
-    [ "$META" -eq 1 ] && out="$out<footer><i>$(meta_line | html_escape)</i></footer>"
+    if [ "$META" -eq 1 ] || project_shown; then
+        out="$out<footer><i>$(meta_line | html_escape)</i></footer>"
+    fi
     printf '%s' "$out"
 }
 
@@ -1999,7 +2047,7 @@ $(fmt_code_block "$f" latex)"
         done
     fi
 
-    if [ "$META" -eq 1 ] && [ -n "$(meta_line)" ]; then
+    if { [ "$META" -eq 1 ] || project_shown; } && [ -n "$(meta_line)" ]; then
         out="$out
 
 $(fmt_italic "$(meta_line)")"
@@ -4579,7 +4627,7 @@ parse_common_args() {
             --cols)               BUTTON_COLS="$2"; ASK_COLS="$2"; shift 2 ;;
             --option|-o)          OPTIONS[${#OPTIONS[@]}]="$2"; shift 2 ;;
             --meta)               META=1; shift ;;
-            --no-meta)            META=0; shift ;;
+            --no-meta)            META=0; PROJECT_MODE="off"; shift ;;
             --prefix)             PREFIX="$2"; shift 2 ;;
             --format)             FORMAT=$(lc "$2"); shift 2 ;;
             --plain)              FORMAT="plain"; shift ;;
@@ -5502,6 +5550,15 @@ cmd_rich() {
     [ -n "$head" ] && rewritten="$head
 
 $rewritten"
+    # The last line names the project, as every message does when asked.
+    if project_shown; then
+        rewritten="$rewritten
+
+📂 $(project_label)"
+        md="$md
+
+📂 $(project_label)"
+    fi
     RICH_REPORT_MD="$md"
     FORMAT="rich"; RICH_KIND="markdown"
     deliver "$rewritten" || finish_failure $?
@@ -5971,6 +6028,7 @@ EOF
             printf 'chat id   : %s\n' "${CHATS:-not set}"
             printf 'chat from : %s\n' "${CHATS_SRC:-nowhere}"
             printf 'machine   : %s\n' "$( [ -n "$(machine_tag)" ] && machine_tag || printf 'not named')"
+            printf 'project   : %s\n' "$( project_shown && printf '%s (on every message)' "$(project_label)" || printf 'not shown; %s config set project on' "$TG_PING_NAME")"
             printf 'topic     : %s\n' "${THREAD_ID:-none}"
             printf 'topics    : %s\n' "${TOPICS_MODE:-off}"
             printf 'quiet     : %s\n' "${QUIET_HOURS:-never}"
@@ -5999,10 +6057,11 @@ EOF
                 format)               var=TG_PING_FORMAT ;;
                 prefix)               var=TG_PING_PREFIX ;;
                 meta|footer)          var=TG_PING_META ;;
+                project|folder)       var=TG_PING_PROJECT ;;
                 chat|chat-id)         var=TG_PING_CHAT_ID ;;
                 topic|thread)         var=TG_PING_THREAD_ID ;;
                 tg_ping_*)            var=$(printf '%s' "$key" | tr '[:lower:]' '[:upper:]') ;;
-                *) die "$EX_USAGE" "unknown setting '$key': use machine, icon, topics, quiet-hours, format, prefix, meta, chat, topic, or a TG_PING_* name" ;;
+                *) die "$EX_USAGE" "unknown setting '$key': use machine, icon, project, topics, quiet-hours, format, prefix, meta, chat, topic, or a TG_PING_* name" ;;
             esac
             case "$var" in
                 TG_PING_TOKEN|TG_PING_BOT_TOKEN)
@@ -6265,7 +6324,7 @@ Levels: --start --info --ok --warn --fail --partial --blocked --debug --level qu
 Delivery: --silent --pin --topic ID --chat ID --reply-to last --cooldown 300 --no-stdin
 Formats: auto (default), --rich (formulas typeset by Telegram), --plain, --html
 Safety: --dry-run --disabled --soft-fail
-Settings: tg-ping config set machine NAME | topics project | quiet-hours 23-08
+Settings: tg-ping config set machine NAME | project on | topics project | quiet-hours 23-08
 Exit codes: 0 sent, 2 usage, 3 config, 4 network, 5 API, 6 rate limit, 7 timeout
 EOS
     exit "$EX_OK"
@@ -6459,7 +6518,9 @@ MESSAGE PARTS, combine them freely
       --quote TEXT      a block quote; --quote-file FILE reads it, --collapse folds it
       --percent N       a progress bar: 45, 45.5, or a count such as 37/512
       --button "L=URL"  an inline button that opens a link, repeatable
-      --meta            footer: machine, repository and time (TG_PING_META chooses)
+      --meta            footer: machine, repository, project and time (TG_PING_META chooses);
+                        with TG_PING_PROJECT=on every message ends with its project
+      --no-meta         no footer on this message, not even the project
       --no-machine      leave out the name of this machine for once
 
 DELIVERY
@@ -6524,12 +6585,14 @@ SETTINGS, first match wins
 ENVIRONMENT
   TG_PING_TOKEN, TG_PING_CHAT_ID    credentials, chat id may be a comma separated list
   TG_PING_MACHINE                   the name of this machine, shown on every message
+  TG_PING_PROJECT=on                every message ends with its project (repository and
+                                    folder, or a name given here), when several agents report
   TG_PING_TOPICS=project            one topic per project and machine in the chat
   TG_PING_QUIET_HOURS=23-08         no sound at night (errors and questions excepted)
   TG_PING_THREAD_ID                 default forum topic
   TG_PING_PREFIX                    label put in front of every message
   TG_PING_FORMAT                    default format, default auto
-  TG_PING_META                      footer fields: host, repo, time (default all three)
+  TG_PING_META                      footer fields: host, repo, project, time (default host,repo,time)
   TG_PING_DISABLED=1                turn every call into a silent no-op
   TG_PING_SOFT_FAIL=1               never fail a pipeline because of a notification
   TG_PING_NO_STDIN=1                never read stdin unless asked with '-'
@@ -6913,11 +6976,14 @@ $TG_PING_NAME config: show or change the settings of the active profile.
   $TG_PING_NAME config unset KEY        remove it
   $TG_PING_NAME config path | files     the profile file, every file consulted
 
-Keys: machine, icon, topics, quiet-hours, format, prefix, meta, chat, topic,
-or any TG_PING_* name. 'config set machine NAME' also records the icon of
-this kind of machine (laptop, desktop or server). The token is set by 'init'.
+Keys: machine, icon, project, topics, quiet-hours, format, prefix, meta,
+chat, topic, or any TG_PING_* name. 'config set machine NAME' also records
+the icon of this kind of machine (laptop, desktop or server); 'config set
+project on' ends every message with the project it comes from (the folder
+inside its repository, or a name of your own). The token is set by 'init'.
 
   $TG_PING_NAME config set machine "home desktop"
+  $TG_PING_NAME config set project on
   $TG_PING_NAME config set quiet-hours 23-08
 EOS
 }
