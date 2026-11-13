@@ -21,6 +21,9 @@ FAILED_NAMES=""
 
 SANDBOX=$(mktemp -d "${TMPDIR:-/tmp}/tg-ping-tests.XXXXXX")
 trap 'rm -rf "$SANDBOX"' EXIT
+# The path as the tool prints it: a TMPDIR ending with a slash (macOS) would
+# otherwise leave a double slash in every expected path.
+SANDBOX=$(cd "$SANDBOX" && pwd)
 
 export PATH="$ROOT/tests/stub:$PATH"
 # Settings of the person running the tests must not leak in. The switches of
@@ -82,7 +85,16 @@ queue() {
     rm -f "$SANDBOX/queue/$m.n"
 }
 
-valid_utf8() { printf '%s' "$1" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; }
+valid_utf8() {
+    # True when the text is well formed UTF-8: python3 decides where it is
+    # installed (the iconv of some systems refuses or alters valid input),
+    # iconv otherwise.
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s' "$1" | python3 -c 'import sys; sys.stdin.buffer.read().decode("utf-8")' >/dev/null 2>&1
+    else
+        printf '%s' "$1" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1
+    fi
+}
 
 balanced_html() {
     # True when the Telegram tags of the text open and close in order.
@@ -117,6 +129,14 @@ check() {
 # A pattern, not 'printf | grep -q': grep stops reading at the first match,
 # and under pipefail the cut pipe would turn a match into a failure.
 contains() { case "$1" in *"$2"*) return 0 ;; esac; return 1; }
+
+bin_awk() {
+    # The awk the tool would choose here, and whether it counts bytes, for
+    # the detail of a failing case.
+    local a
+    a="${TG_PING_AWK:-$("$TG" doctor 2>/dev/null | sed -n 's/^\[\(ok  \|warn\)\] awk *//p' | head -n1)}"
+    printf '%s' "${a:-?}"
+}
 
 capture_has() { [ -f "$CAPTURE" ] && grep -Fq -- "$1" "$CAPTURE"; }
 capture_count() { [ -f "$CAPTURE" ] && grep -c "^METHOD	$1\$" "$CAPTURE" || echo 0; }
@@ -999,7 +1019,7 @@ if describe "captions: 400 mathematical symbols stay whole"; then
     if [ "$sent" = "$cap" ] && valid_utf8 "$sent" && [ "$(methods)" = "sendPhoto " ]; then
         ok "captions: 400 mathematical symbols stay whole"
     else
-        bad "captions: 400 mathematical symbols stay whole" "methods: $(methods) length ${#sent}"
+        bad "captions: 400 mathematical symbols stay whole" "methods: $(methods) length ${#sent} equal=$( [ "$sent" = "$cap" ] && echo yes || echo no) utf8=$( valid_utf8 "$sent" && echo yes || echo no) awk=$(bin_awk)"
     fi
 fi
 
@@ -1020,7 +1040,7 @@ fi
 if describe "split: a line of 2000 symbols fits one message"; then
     start_case
     tg --plain "$(printf '⩽%.0s' $(seq 1 2000))"
-    check "split: a line of 2000 symbols fits one message" "methods: $(methods)" \
+    check "split: a line of 2000 symbols fits one message" "methods: $(methods) utf8=$( valid_utf8 "$(field_value sendMessage text)" && echo yes || echo no) length=${#OUTPUT} awk=$(bin_awk)" \
         "$( [ "$(methods)" = "sendMessage " ] && valid_utf8 "$(field_value sendMessage text)" && echo 0 || echo 1 )"
 fi
 
