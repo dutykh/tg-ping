@@ -134,7 +134,7 @@ bin_awk() {
     # The awk the tool would choose here, and whether it counts bytes, for
     # the detail of a failing case.
     local a
-    a="${TG_PING_AWK:-$("$TG" doctor 2>/dev/null | sed -n 's/^\[\(ok  \|warn\)\] awk *//p' | head -n1)}"
+    a="${TG_PING_AWK:-$(env -u TGP_CAPTURE TG_PING_DISABLED=1 "$TG" doctor 2>/dev/null | sed -n 's/^\[\(ok  \|warn\)\] awk *//p' | head -n1)}"
     printf '%s' "${a:-?}"
 }
 
