@@ -2028,6 +2028,7 @@ fi
 
 if describe "receive: without a prompt the next photo is taken, at its largest size"; then
     start_case
+    mkdir -p "$SANDBOX/in"
     printf '%s\n' '{"message":{"message_id":6002,'"$CHAT_JSON"',"from":{"id":77},"date":{{now}},"photo":[{"file_id":"small","width":90},{"file_id":"big","width":800,"file_size":9}],"caption":"the board"}}' \
         > "$SANDBOX/updates"
     export TGP_STUB_UPDATES="$SANDBOX/updates"
@@ -2042,6 +2043,7 @@ fi
 
 if describe "receive: --kind document leaves a photo for others"; then
     start_case
+    mkdir -p "$SANDBOX/in"
     export TGP_STUB_UPDATES="$SANDBOX/updates"
     "$TG" receive --wait 2 --kind document --out "$SANDBOX/in" >/dev/null 2>&1; RC=$?
     if [ "$RC" -eq 7 ] && ls "$TG_PING_STATE_DIR"/bot.*/held/101 >/dev/null 2>&1 && ! contains "$(methods)" "getFile"; then
@@ -2053,6 +2055,7 @@ fi
 
 if describe "receive: a file sent before the wait began is still taken"; then
     start_case
+    mkdir -p "$SANDBOX/in"
     printf '%s\n' '{"message":{"message_id":6003,'"$CHAT_JSON"',"from":{"id":77},"date":{{now}},"document":{"file_id":"doc-3","file_name":"earlier.txt","mime_type":"text/plain","file_size":12}}}' \
         > "$SANDBOX/updates"
     export TGP_STUB_UPDATES="$SANDBOX/updates"
@@ -2071,6 +2074,7 @@ fi
 
 if describe "receive: --out names the file and nothing is overwritten"; then
     start_case
+    mkdir -p "$SANDBOX/in"
     export TGP_STUB_UPDATES="$SANDBOX/updates"
     first=$("$TG" receive --wait 5 --out "$SANDBOX/in/given.txt" 2>/dev/null)
     start_case
@@ -2085,6 +2089,7 @@ fi
 
 if describe "receive: a file of another kind does not answer the prompt"; then
     start_case
+    mkdir -p "$SANDBOX/in"
     printf '%s\n' '{"message":{"message_id":6004,'"$CHAT_JSON"',"from":{"id":77},"date":{{now}},"photo":[{"file_id":"p","width":10}],"reply_to_message":{"message_id":{{mid:1}}}}}' \
         > "$SANDBOX/updates"
     export TGP_STUB_UPDATES="$SANDBOX/updates"
