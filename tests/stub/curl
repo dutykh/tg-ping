@@ -104,6 +104,11 @@ while IFS= read -r line; do
 done < "$cfg"
 
 method=${url##*/}
+# A file download (the URL of getFile's file_path) is recorded as "download"
+# and answered with a few bytes written to the output file.
+case "$url" in
+    */file/bot*) method="download" ;;
+esac
 
 field() {
     # field NAME -> the value of a request field, empty when absent.
@@ -221,6 +226,11 @@ default_reply() {
             printf '{"ok":true,"result":{"id":%s,"type":"private","first_name":"Tester"}}' "$(chat_json)" ;;
         getWebhookInfo)
             printf '{"ok":true,"result":{"url":"","pending_update_count":0}}' ;;
+        getFile)
+            printf '{"ok":true,"result":{"file_id":%s,"file_unique_id":"u1","file_size":12,"file_path":"documents/file_%s.bin"}}' \
+                "$(json_str "$(field file_id || true)")" "$(cat "$D/count" 2>/dev/null || echo 1)" ;;
+        download)
+            printf 'FILE CONTENT' ;;
         createForumTopic)
             n=$(cat "$D/topic" 2>/dev/null || echo 899); n=$(( n + 1 )); printf '%s' "$n" > "$D/topic"
             printf '{"ok":true,"result":{"message_thread_id":%s,"name":%s,"icon_color":7322096}}' \

@@ -20,6 +20,7 @@ _tg_ping() {
         'wait:report when a running process ends'
         'ask:ask a question and wait for the answer'
         'poll:send a poll'
+        'receive:wait for a file sent from the phone and save it'
         'edit:correct a message already sent'
         'delete:withdraw a message already sent'
         'init:set up the bot and the chat'
@@ -32,7 +33,7 @@ _tg_ping() {
         'version:print the version'
         'help:help on a command'
     )
-    options=(--anonymous --api --as --attach --attach-log --attach-log-always --background --bg --blocked --button --caption --chat --code --code-file --collapse --cols --config --cooldown --correct --debug --default --disabled --display --dpi --dry-run --each --edit-only --emoji --env-file --error --every --exit-zero --expected --fail --field --file --format --free-text --help --html --id --info --inline --insecure --item --json --key --label --lang --language --last --latex --level --limit --log --markdown --math --max-parts --md --message --meta --multi --name --native --no-fallback --no-header --no-machine --no-meta --no-preview --no-stdin --notify-start --ok --on --option --original --out --pages --partial --percent --pin --plain --preamble --prefix --preview --profile --prose --protect --quiet --quiet-output --quote --quote-file --remote --replace --reply-to --retries --rich --sep --separator --silent --soft-fail --stall --start --strict --success --tail --tee --text --thread --timeout --title --token --token-file --topic --truncate --typst --verbose --version --wait --warn --warning)
+    options=(--alert --anonymous --api --as --attach --attach-log --attach-log-always --background --bg --blocked --button --caption --chat --code --code-file --collapse --cols --config --cooldown --correct --debug --default --disabled --display --document --dpi --dry-run --each --edit-only --emoji --env-file --error --every --exit-zero --expected --fail --field --file --format --free-text --help --html --id --info --inline --insecure --item --json --key --kind --label --lang --language --last --latex --level --limit --log --markdown --math --max-parts --md --message --meta --multi --name --native --no-fallback --no-header --no-machine --no-meta --no-preview --no-stdin --notify-start --ok --on --option --original --out --pages --partial --percent --photo --pin --plain --preamble --prefix --preview --profile --prose --protect --quiet --quiet-output --quote --quote-file --remote --replace --reply-to --retries --rich --sep --separator --silent --soft-fail --stall --start --strict --success --tail --tee --text --thread --timeout --title --token --token-file --topic --truncate --typst --verbose --version --wait --warn --warning)
     case "${words[CURRENT-1]}" in
         --level|-L) compadd -- start info success warn error partial blocked question progress debug math; return ;;
         --format) compadd -- auto rich html markdown plain; return ;;
@@ -43,7 +44,7 @@ _tg_ping() {
             profiles=(${XDG_CONFIG_HOME:-$HOME/.config}/tg-ping/*.env(N:t:r))
             compadd -a profiles; return ;;
         --code-file|--quote-file|--out|--preamble|--env-file|--config|--token-file|--file|--log) _files; return ;;
-        -m|--message|--text|-t|--title|--emoji|--item|--field|--code|--lang|--language|--quote|--percent|--button|--cols|--option|-o|--prefix|--reply-to|--topic|--thread|--chat|-c|--token|--api|--timeout|--retries|--cooldown|--key|--id|--max-parts|--caption|--name|--dpi|--sep|--separator|--wait|--default|--correct|--each|--math|--pages|--expected|--label|-l|--tail|--limit|--every|--stall) return ;;
+        -m|--message|--text|-t|--title|--emoji|--item|--field|--code|--lang|--language|--quote|--percent|--button|--cols|--option|-o|--prefix|--reply-to|--topic|--thread|--chat|-c|--token|--api|--timeout|--retries|--cooldown|--key|--id|--max-parts|--caption|--name|--dpi|--sep|--separator|--wait|--default|--correct|--each|--math|--pages|--expected|--photo|--document|--kind|--label|-l|--tail|--limit|--every|--stall|--alert) return ;;
     esac
     if (( CURRENT == 3 )); then
         case "${words[2]}" in

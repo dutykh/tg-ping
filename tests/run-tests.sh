@@ -1786,12 +1786,300 @@ if describe "machine: config set machine records the icon of a desktop"; then
     rm -f "$file"
 fi
 
+# --- repairs of 2.1 ----------------------------------------------------------
+if describe "settings: a value with both kinds of quotes survives"; then
+    start_case
+    "$TG" config set prefix 'it'"'"'s a "test" \ back' >/dev/null 2>&1
+    file="$XDG_CONFIG_HOME/tg-ping/default.env"
+    env -u TG_PING_PREFIX "$TG" "quoted" >/dev/null 2>&1
+    if grep -q '^TG_PING_PREFIX="it'"'"'s a \\"test\\" \\\\ back"$' "$file" &&
+       [ "$(field_value sendMessage text)" = 'it'"'"'s a "test" \ back quoted' ]; then
+        ok "settings: a value with both kinds of quotes survives"
+    else
+        bad "settings: a value with both kinds of quotes survives" "$(cat "$file") / $(field_value sendMessage text)"
+    fi
+    rm -f "$file"
+fi
+
+if describe "usage: --reply-to refuses a word and understands last"; then
+    start_case
+    tg --reply-to abc "x"
+    first=$RC
+    tg "the first message"
+    tg --reply-to last "the second answers it"
+    if [ "$first" -eq 2 ] && [ "$(methods)" = "sendMessage sendMessage " ] &&
+       contains "$(nth_field sendMessage 2 reply_parameters)" '"message_id":4242'; then
+        ok "usage: --reply-to refuses a word and understands last"
+    else
+        bad "usage: --reply-to refuses a word and understands last" "rc=$first methods: $(methods) $(nth_field sendMessage 2 reply_parameters)"
+    fi
+fi
+
+if describe "dispatch: a command word followed by options alone stays text"; then
+    start_case
+    tg --ok --title "Ready" photo --silent
+    if [ "$RC" -eq 0 ] && [ "$(methods)" = "sendMessage " ] && contains "$(field_value sendMessage text)" "photo"; then
+        ok "dispatch: a command word followed by options alone stays text"
+    else
+        bad "dispatch: a command word followed by options alone stays text" "rc=$RC methods: $(methods) $OUTPUT"
+    fi
+fi
+
+if describe "send: words after -m are not dropped silently"; then
+    start_case
+    tg -m "the body" extra words
+    if [ "$RC" -eq 0 ] && contains "$OUTPUT" "extra words" && [ "$(field_value sendMessage text)" = "the body" ]; then
+        ok "send: words after -m are not dropped silently"
+    else
+        bad "send: words after -m are not dropped silently" "rc=$RC $OUTPUT"
+    fi
+fi
+
+if describe "media: buttons on an album warn, the album still goes"; then
+    start_case
+    tg photo "$SANDBOX/p1.png" "$SANDBOX/p2.png" --button "Open=https://example.org"
+    if [ "$RC" -eq 0 ] && [ "$(methods)" = "sendMediaGroup " ] && contains "$OUTPUT" "no buttons on an album"; then
+        ok "media: buttons on an album warn, the album still goes"
+    else
+        bad "media: buttons on an album warn, the album still goes" "rc=$RC methods: $(methods) $OUTPUT"
+    fi
+fi
+
+if describe "buttons: a label may hold an equals sign"; then
+    start_case
+    tg "x" --button "a=b=https://example.org/?q=1"
+    kb=$(field_value sendMessage reply_markup)
+    check "buttons: a label may hold an equals sign" "$kb" \
+        "$( contains "$kb" '"text":"a=b","url":"https://example.org/?q=1"' && echo 0 || echo 1 )"
+fi
+
+# --- pictures and documents with any message (2.1) ---------------------------
+if describe "attachments: a picture carries a short message as its caption"; then
+    start_case
+    tg --ok --title "Figure ready" "The spectrum is real." --photo "$SANDBOX/fig.png"
+    if [ "$(methods)" = "sendPhoto " ] && contains "$(field_value sendPhoto caption)" "<b>Figure ready</b>" &&
+       capture_has "UPLOAD	photo=$SANDBOX/fig.png"; then
+        ok "attachments: a picture carries a short message as its caption"
+    else
+        bad "attachments: a picture carries a short message as its caption" "methods: $(methods) $OUTPUT"
+    fi
+fi
+
+if describe "attachments: pictures and a document follow a long text as its reply"; then
+    start_case
+    printf 'REPORT' > "$SANDBOX/r.pdf"
+    long=$(awk 'BEGIN{for(i=0;i<150;i++) printf "word%d ", i}')
+    tg --title "Long" "$long" --photo "$SANDBOX/p1.png" --photo "$SANDBOX/p2.png" --document "$SANDBOX/r.pdf"
+    if [ "$(methods)" = "sendMessage sendMediaGroup sendDocument " ] &&
+       contains "$(field_value sendMediaGroup reply_parameters)" '"message_id":4242' &&
+       contains "$(field_value sendDocument reply_parameters)" '"message_id":4242'; then
+        ok "attachments: pictures and a document follow a long text as its reply"
+    else
+        bad "attachments: pictures and a document follow a long text as its reply" "methods: $(methods)"
+    fi
+fi
+
+if describe "attachments: with buttons the text goes first, the album follows"; then
+    start_case
+    tg "two moments" --photo "$SANDBOX/p1.png" --photo "$SANDBOX/p2.png" --button "Open=https://example.org"
+    if [ "$(methods)" = "sendMessage sendMediaGroup " ] && contains "$(field_value sendMessage reply_markup)" "example.org" &&
+       ! contains "$OUTPUT" "no buttons on an album"; then
+        ok "attachments: with buttons the text goes first, the album follows"
+    else
+        bad "attachments: with buttons the text goes first, the album follows" "methods: $(methods) $OUTPUT"
+    fi
+fi
+
+if describe "attachments: a rich message embeds them"; then
+    start_case
+    tg --rich --title "Figure" "the body" --photo "$SANDBOX/fig.png" --document "$SANDBOX/r.pdf"
+    rm_=$(field_value sendRichMessage rich_message)
+    if [ "$(methods)" = "sendRichMessage " ] && contains "$rm_" '<img src=\"tg://photo?id=a1\">' &&
+       contains "$rm_" '<tg-document src=\"tg://document?id=a2\">' &&
+       contains "$rm_" '"media":[{"id":"a1","media":{"type":"photo","media":"attach://a1"}}' &&
+       capture_has "UPLOAD	a1=$SANDBOX/fig.png" && capture_has "UPLOAD	a2=$SANDBOX/r.pdf"; then
+        ok "attachments: a rich message embeds them"
+    else
+        bad "attachments: a rich message embeds them" "methods: $(methods) $rm_"
+    fi
+fi
+
+if describe "attachments: a refused rich message keeps its picture"; then
+    start_case
+    queue sendRichMessage "400	{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: unsupported\"}"
+    tg --rich --title "Figure" "the body" --photo "$SANDBOX/fig.png"
+    if [ "$RC" -eq 0 ] && [ "$(methods)" = "sendRichMessage sendPhoto " ] &&
+       contains "$(field_value sendPhoto caption)" "<b>Figure</b>"; then
+        ok "attachments: a refused rich message keeps its picture"
+    else
+        bad "attachments: a refused rich message keeps its picture" "rc=$RC methods: $(methods)"
+    fi
+    rm -f "$TG_PING_STATE_DIR/rich.refused"
+fi
+
+if describe "run: --photo sends the figure the command made, a missing one is left out"; then
+    start_case
+    "$TG" run --label "figure step" --photo "$SANDBOX/fig.png" --photo "$SANDBOX/absent.png" -- sh -c 'echo drawn' > "$SANDBOX/out" 2>&1; rc=$?
+    if [ "$rc" -eq 0 ] && [ "$(methods)" = "sendPhoto " ] && contains "$(field_value sendPhoto caption)" "finished in" &&
+       grep -q "absent.png" "$SANDBOX/out"; then
+        ok "run: --photo sends the figure the command made, a missing one is left out"
+    else
+        bad "run: --photo sends the figure the command made, a missing one is left out" "rc=$rc methods: $(methods) $(cat "$SANDBOX/out")"
+    fi
+fi
+
+if describe "progress: a picture follows the message as a reply"; then
+    start_case
+    id=$("$TG" progress start "Training" --photo "$SANDBOX/fig.png" 2>/dev/null)
+    if [ "$id" = "4242" ] && [ "$(methods)" = "sendMessage sendPhoto " ] &&
+       contains "$(field_value sendPhoto reply_parameters)" '"message_id":4242'; then
+        ok "progress: a picture follows the message as a reply"
+    else
+        bad "progress: a picture follows the message as a reply" "id=$id methods: $(methods)"
+    fi
+fi
+
+# --- alerts of run (2.1) -------------------------------------------------------
+if describe "run: --alert warns at the first matching line, once per pattern"; then
+    start_case
+    "$TG" run --alert 'NaN|diverg' --alert 'converged' --label "solver" -- \
+        sh -c 'echo step 1; echo step 2; echo residual NaN at step 3; sleep 2; echo loss NaN again; echo converged; sleep 2' >/dev/null 2>&1
+    n=$(grep -c 'output matched' "$CAPTURE")
+    first=$(nth_field sendMessage 1 text)
+    if [ "$n" -eq 2 ] && contains "$first" "NaN|diverg" && contains "$first" "at line 3" &&
+       contains "$first" "residual NaN at step 3" && contains "$(nth_field sendMessage 2 text)" "converged"; then
+        ok "run: --alert warns at the first matching line, once per pattern"
+    else
+        bad "run: --alert warns at the first matching line, once per pattern" "alerts=$n methods: $(methods) first=$first"
+    fi
+fi
+
+if describe "run: --alert refuses a broken pattern"; then
+    start_case
+    "$TG" run --alert '(' -- true >/dev/null 2>&1; rc=$?
+    check "run: --alert refuses a broken pattern" "rc=$rc" "$( [ "$rc" -eq 2 ] && [ ! -f "$CAPTURE" ] && echo 0 || echo 1 )"
+fi
+
+# --- receive: files from the phone (2.1) ---------------------------------------
+if describe "receive: without jq and python3 the refusal is clear"; then
+    start_case
+    TG_PING_HIDE="jq python3" "$TG" receive --wait 1 > "$SANDBOX/out" 2>&1; rc=$?
+    if [ "$rc" -eq 3 ] && grep -q "needs jq or python3" "$SANDBOX/out" && [ ! -f "$CAPTURE" ]; then
+        ok "receive: without jq and python3 the refusal is clear"
+    else
+        bad "receive: without jq and python3 the refusal is clear" "rc=$rc $(cat "$SANDBOX/out")"
+    fi
+fi
+
+if no_json_reader; then
+    SKIP=$((SKIP + 7))
+else
+
+if describe "ask: pictures go first and the question answers them"; then
+    start_case
+    export TGP_STUB_ASK=1
+    answer=$("$TG" ask "Which figure?" --photo "$SANDBOX/p1.png" --photo "$SANDBOX/p2.png" -o left -o right --wait 10 2>/dev/null)
+    RC=$?
+    unset TGP_STUB_ASK
+    m=$(methods)
+    if [ "$RC" -eq 0 ] && [ "$answer" = "left" ] && [ "${m%% *}" = "sendMediaGroup" ] &&
+       contains "$(field_value sendMessage reply_parameters)" '"message_id":4242'; then
+        ok "ask: pictures go first and the question answers them"
+    else
+        bad "ask: pictures go first and the question answers them" "rc=$RC answer=$answer methods: $m"
+    fi
+fi
+
+if describe "receive: a document answering the prompt is saved under its name"; then
+    start_case
+    rm -rf "$SANDBOX/in"; mkdir -p "$SANDBOX/in"
+    printf '%s\n' '{"message":{"message_id":6001,'"$CHAT_JSON"',"from":{"id":77},"date":{{now}},"document":{"file_id":"doc-1","file_name":"notes.pdf","mime_type":"application/pdf","file_size":12},"caption":"here it is","reply_to_message":{"message_id":{{mid:1}}}}}' \
+        > "$SANDBOX/updates"
+    export TGP_STUB_UPDATES="$SANDBOX/updates"
+    out=$("$TG" receive "Please send the PDF" --wait 10 --out "$SANDBOX/in" 2>/dev/null); RC=$?
+    if [ "$RC" -eq 0 ] && [ "$out" = "$SANDBOX/in/notes.pdf" ] && [ "$(cat "$SANDBOX/in/notes.pdf")" = "FILE CONTENT" ] &&
+       [ "$(methods)" = "sendMessage getUpdates getFile download setMessageReaction editMessageText " ] &&
+       [ "$(field_value getFile file_id)" = "doc-1" ] && contains "$(field_value editMessageText text)" "received: notes.pdf"; then
+        ok "receive: a document answering the prompt is saved under its name"
+    else
+        bad "receive: a document answering the prompt is saved under its name" "rc=$RC out=$out methods: $(methods)"
+    fi
+fi
+
+if describe "receive: without a prompt the next photo is taken, at its largest size"; then
+    start_case
+    printf '%s\n' '{"message":{"message_id":6002,'"$CHAT_JSON"',"from":{"id":77},"date":{{now}},"photo":[{"file_id":"small","width":90},{"file_id":"big","width":800,"file_size":9}],"caption":"the board"}}' \
+        > "$SANDBOX/updates"
+    export TGP_STUB_UPDATES="$SANDBOX/updates"
+    out=$("$TG" receive --wait 10 --out "$SANDBOX/in" --json 2>/dev/null); RC=$?
+    if [ "$RC" -eq 0 ] && [ "$(field_value getFile file_id)" = "big" ] && contains "$out" '"kind":"photo"' &&
+       contains "$out" '"caption":"the board"' && contains "$out" "$SANDBOX/in/photo-" && contains "$out" '.jpg"'; then
+        ok "receive: without a prompt the next photo is taken, at its largest size"
+    else
+        bad "receive: without a prompt the next photo is taken, at its largest size" "rc=$RC out=$out methods: $(methods)"
+    fi
+fi
+
+if describe "receive: --kind document leaves a photo for others"; then
+    start_case
+    export TGP_STUB_UPDATES="$SANDBOX/updates"
+    "$TG" receive --wait 2 --kind document --out "$SANDBOX/in" >/dev/null 2>&1; RC=$?
+    if [ "$RC" -eq 7 ] && ls "$TG_PING_STATE_DIR"/bot.*/held/101 >/dev/null 2>&1 && ! contains "$(methods)" "getFile"; then
+        ok "receive: --kind document leaves a photo for others"
+    else
+        bad "receive: --kind document leaves a photo for others" "rc=$RC methods: $(methods)"
+    fi
+fi
+
+if describe "receive: a file sent before the wait began is still taken"; then
+    start_case
+    printf '%s\n' '{"message":{"message_id":6003,'"$CHAT_JSON"',"from":{"id":77},"date":{{now}},"document":{"file_id":"doc-3","file_name":"earlier.txt","mime_type":"text/plain","file_size":12}}}' \
+        > "$SANDBOX/updates"
+    export TGP_STUB_UPDATES="$SANDBOX/updates"
+    "$TG" ask "Anyone?" -o yes --wait 1 >/dev/null 2>&1
+    held=$(ls "$TG_PING_STATE_DIR"/bot.*/held/ 2>/dev/null)
+    out=$("$TG" receive --wait 5 --out "$SANDBOX/in" 2>/dev/null); RC=$?
+    if [ "$held" = "101" ] && [ "$RC" -eq 0 ] && [ "$out" = "$SANDBOX/in/earlier.txt" ] &&
+       [ -z "$(ls "$TG_PING_STATE_DIR"/bot.*/held/ 2>/dev/null)" ]; then
+        ok "receive: a file sent before the wait began is still taken"
+    else
+        bad "receive: a file sent before the wait began is still taken" "held=$held rc=$RC out=$out"
+    fi
+fi
+
+if describe "receive: --out names the file and nothing is overwritten"; then
+    start_case
+    export TGP_STUB_UPDATES="$SANDBOX/updates"
+    first=$("$TG" receive --wait 5 --out "$SANDBOX/in/given.txt" 2>/dev/null)
+    start_case
+    export TGP_STUB_UPDATES="$SANDBOX/updates"
+    second=$("$TG" receive --wait 5 --out "$SANDBOX/in/given.txt" 2>/dev/null)
+    if [ "$first" = "$SANDBOX/in/given.txt" ] && [ "$second" = "$SANDBOX/in/given-2.txt" ] && [ -s "$second" ]; then
+        ok "receive: --out names the file and nothing is overwritten"
+    else
+        bad "receive: --out names the file and nothing is overwritten" "$first / $second"
+    fi
+fi
+
+if describe "receive: a file of another kind does not answer the prompt"; then
+    start_case
+    printf '%s\n' '{"message":{"message_id":6004,'"$CHAT_JSON"',"from":{"id":77},"date":{{now}},"photo":[{"file_id":"p","width":10}],"reply_to_message":{"message_id":{{mid:1}}}}}' \
+        > "$SANDBOX/updates"
+    export TGP_STUB_UPDATES="$SANDBOX/updates"
+    "$TG" receive "Send the PDF" --kind document --wait 2 --out "$SANDBOX/in" >/dev/null 2>&1; RC=$?
+    check "receive: a file of another kind does not answer the prompt" "rc=$RC methods: $(methods)" \
+        "$( [ "$RC" -eq 7 ] && ! contains "$(methods)" "getFile" && echo 0 || echo 1 )"
+fi
+
+fi   # files need a JSON reader
+unset TGP_STUB_UPDATES
+
 # --- help ------------------------------------------------------------------
 if describe "help: --help documents every command"; then
     start_case
     OUTPUT=$("$TG" --help 2>&1)
     missing=""
-    for word in send code table math photo file media run progress ask poll init doctor chats hook; do
+    for word in send code table math photo file media run progress ask poll receive init doctor chats hook; do
         contains "$OUTPUT" "  $word" || missing="$missing $word"
     done
     check "help: --help documents every command" "missing:$missing" \

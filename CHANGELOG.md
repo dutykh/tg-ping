@@ -9,6 +9,76 @@
 
 This project follows semantic versioning.
 
+## 2.1.0
+
+The conversation now goes both ways, and a message carries what it is
+about. Any message takes pictures and documents, a question shows the
+figures it asks about, the phone can send a file back to the machine, and a
+long computation is watched for the words that mean trouble. Six defects
+found in a reading of the whole program are repaired first.
+
+### Repairs
+
+* A setting whose value holds both kinds of quotes (a prefix such as
+  `it's a "test"`) was written in a form the reader cut short, after which
+  every message carried the stump. Values are now written between double
+  quotes, where a backslash escapes a quote or a backslash, and read back
+  the same way.
+* The option `--reply-to` takes only the number of a message, or `last`:
+  a word there used to reach Telegram as malformed JSON, which lost the
+  whole message.
+* A command word followed by options alone (`tg-ping --title Ready photo
+  --silent`) is text again, as the documentation says; it used to be read
+  as the command and stop with a usage error.
+* Words left after a body given with `-m` are no longer dropped silently:
+  a warning says so.
+* The buttons given with an album, which Telegram cannot carry, are left
+  out with a warning instead of vanishing.
+* A button label may hold an equals sign: the label ends where the address
+  begins.
+
+### Pictures and documents with any message
+
+* The options `--photo FILE` and `--document FILE`, both repeatable, make
+  pictures and documents travel with any message: the text becomes their
+  caption when it fits, and otherwise goes first with the files as its
+  reply, which is also what happens when the message has buttons, since
+  an album holds none. A vector figure is drawn first, `--each` captions
+  each file, and a rich message embeds them.
+* The report of `run` and the message of `wait` take them, so the figure
+  a computation draws travels with its own report; a figure that does not
+  exist at the end is left out, and the report still goes.
+* A question (`ask`) with `--photo` or `--math` sends the pictures first,
+  as an album the question answers, so that the buttons sit right under
+  the question; a progress message sends them as a reply, since an edited
+  text cannot carry them, and `progress done` with its final reply.
+* The option `--reply-to last` makes a message answer the last one this
+  project sent.
+
+### Files from the phone
+
+* The command `receive` waits for a file sent to the bot (a photo, a
+  document, a video, a voice note), saves it under its own name, or a name
+  made of its kind and the time, never overwriting anything, and prints
+  its path, alone, on stdout. With a prompt the question goes out first
+  and the file that answers it or follows it is taken; without one the
+  next file of the chat, or one sent in the last ten minutes that nobody
+  claimed. `--out` names the folder or the file, `--kind` takes one kind
+  only, `--json` adds the kind, the name, the caption and the size, and
+  the exit code is 7 when nothing arrives before the deadline.
+* The shared inbox routes files as it routes answers: a file reaches the
+  `receive` whose prompt it answers, else the one it follows, else the
+  oldest one waiting for its kind, and is kept for another computer
+  otherwise. A file kept this way is handed to a `receive` that starts
+  later.
+
+### Long computations
+
+* The option `run --alert PATTERN` warns at the first line of the output
+  matching the pattern (an extended regular expression, repeatable, each
+  pattern warning once), with that line and the lines before it, so that
+  a solver producing `NaN` is caught at once.
+
 ## 2.0.0
 
 The second version makes delivery dependable before it adds anything: no

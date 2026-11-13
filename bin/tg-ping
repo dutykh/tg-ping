@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-TG_PING_VERSION="2.0.0"
+TG_PING_VERSION="2.1.0"
 TG_PING_NAME="tg-ping"
 
 TAB=$(printf '\t')
@@ -282,11 +282,10 @@ settings_set() {
     # empty VALUE removes the key. The file is created with mode 600.
     local file="$1" key="$2" value="$3" line dir tmp
     case "$value" in
-        *[[:space:]\#\"\']*|"")
-            case "$value" in
-                *\"*) line="$key='$value'" ;;
-                *)    line="$key=\"$value\"" ;;
-            esac ;;
+        *[[:space:]\#\"\'\\]*|"")
+            # Double quotes, inside which a backslash escapes a quote or a
+            # backslash: a value may then hold both kinds of quotes.
+            line="$key=\"$(printf '%s' "$value" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')\"" ;;
         *) line="$key=$value" ;;
     esac
     [ -n "$value" ] || line=""
@@ -398,7 +397,7 @@ SECRET_KEYS=" TG_PING_TOKEN TG_PING_BOT_TOKEN TELEGRAM_BOT_TOKEN TELEGRAM_TOKEN 
 
 env_file_get() {
     # env_file_get FILE KEY -> value on stdout; fails when the key is absent.
-    local file="$1" key="$2" line value
+    local file="$1" key="$2" line value rest c
     [ -r "$file" ] || return 1
     line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$file" 2>/dev/null | tail -n1) || true
     [ -n "$line" ] || return 1
@@ -406,9 +405,20 @@ env_file_get() {
     value=${value%"$CR"}
     value="${value#"${value%%[![:space:]]*}"}"
     # One quoted string, whatever follows it being a comment, or a bare value
-    # that ends where a blank and a # begin a comment.
+    # that ends where a blank and a # begin a comment. Inside double quotes
+    # a backslash escapes a quote or a backslash, as settings_set writes
+    # them; inside single quotes nothing is special.
     case "$value" in
-        \"*) value=${value#\"}; value=${value%%\"*} ;;
+        \"*)
+            rest=${value#\"}; value=""
+            while [ -n "$rest" ]; do
+                c=${rest%"${rest#?}"}; rest=${rest#?}
+                case "$c" in
+                    \\) case "$rest" in \"*|\\*) c=${rest%"${rest#?}"}; rest=${rest#?} ;; esac ;;
+                    \") break ;;
+                esac
+                value="$value$c"
+            done ;;
         \'*) value=${value#\'}; value=${value%%\'*} ;;
         *)   value=$(printf '%s' "$value" | sed -e 's/[[:space:]]#.*$//' -e 's/[[:space:]]*$//') ;;
     esac
@@ -813,9 +823,21 @@ req_file() {
 
 req_reply() {
     # req_reply MESSAGE_ID: answer that message; the message still goes out
-    # when the one it answers has been deleted.
-    [ -n "${1:-}" ] || return 0
-    req_add reply_parameters "{\"message_id\":$1,\"allow_sending_without_reply\":true}"
+    # when the one it answers has been deleted. The word "last" stands for
+    # the last message this project sent to the chat of the request.
+    local id="${1:-}" chat="" entry
+    [ -n "$id" ] || return 0
+    if [ "$id" = "last" ]; then
+        for entry in ${REQ_FIELDS[@]+"${REQ_FIELDS[@]}"}; do
+            case "$entry" in chat_id=*) chat=${entry#chat_id=} ;; esac
+        done
+        id=$(cat "$(last_file "$chat")" 2>/dev/null || true)
+        if ! is_number "$id" || [ "$id" = "0" ]; then
+            note "no message of this project is remembered in chat $chat, sending without a reply"
+            return 0
+        fi
+    fi
+    req_add reply_parameters "{\"message_id\":$id,\"allow_sending_without_reply\":true}"
 }
 
 req_no_preview() {
@@ -1853,7 +1875,7 @@ meta_line() {
 build_message_rich() {
     # The message as the HTML of a rich message: the same parts as the
     # classic form, laid out as blocks, with formulas typeset by Telegram.
-    local out="" head="" emoji tag f item entry key value
+    local out="" head="" emoji tag f item entry key value i id
     emoji="$EMOJI"
     [ -n "$emoji" ] || emoji=$(level_emoji "$LEVEL")
     tag=$(machine_tag)
@@ -1885,6 +1907,20 @@ build_message_rich() {
         out="$out<blockquote$( [ "$COLLAPSE" -eq 1 ] && printf ' expandable')>$(printf '%s' "$QUOTE_TEXT" | html_escape | awk_run 'BEGIN{ORS=""} {if (NR>1) print "<br>"; print}')</blockquote>"
     fi
     [ -n "$CODE_TEXT" ] && out="$out$(fmt_code_block "$CODE_TEXT" "$CODE_LANG")"
+    # The pictures and documents prepared for this rich message, embedded.
+    if [ -n "$RICH_MEDIA_JSON" ]; then
+        i=0
+        while [ "$i" -lt "${#MP[@]}" ]; do
+            id="a$(( i + 1 ))"
+            case "${MK[$i]}" in
+                photo)           out="$out<img src=\"tg://photo?id=$id\">" ;;
+                video|animation) out="$out<video src=\"tg://video?id=$id\">" ;;
+                audio)           out="$out<audio src=\"tg://audio?id=$id\">" ;;
+                *)               out="$out<tg-document src=\"tg://document?id=$id\">" ;;
+            esac
+            i=$(( i + 1 ))
+        done
+    fi
     [ "$META" -eq 1 ] && out="$out<footer><i>$(meta_line | html_escape)</i></footer>"
     printf '%s' "$out"
 }
@@ -2180,15 +2216,16 @@ rich_refusal() {
 }
 
 rich_fallback() {
-    # The classic form of the current message, formulas as their source; a
-    # Markdown report goes as text, its figures following as an album.
-    local FORMAT=auto MATH_AS_CODE=1
+    # The classic form of the current message, formulas as their source and
+    # the pictures as captions or as a reply; a Markdown report goes as
+    # text, its figures following as an album.
+    local FORMAT=auto MATH_AS_CODE=1 RICH_MEDIA_JSON=""
     if [ "$RICH_KIND" = "markdown" ]; then
         local RICH_KIND=html
         rich_report_fallback
         return $?
     fi
-    deliver "$(build_message)"
+    send_with_attachments
 }
 
 deliver_rich() {
@@ -2622,6 +2659,9 @@ _album_json() {
 send_album() {
     # send_album INDEX...: two to ten files of one family as one album.
     local idx rc
+    if [ "$MEDIA_KEYBOARD" -eq 1 ] && [ ${#BUTTONS[@]} -gt 0 ]; then
+        warn "Telegram puts no buttons on an album: the buttons are left out (send one picture, or the text with the buttons first)"
+    fi
     req_reset
     req_add chat_id "$CHATS_CURRENT"
     req_add media "$(_album_json 0 "$@")"
@@ -2968,14 +3008,18 @@ updates_extract() {
     # fields when read by 'read'. A line break inside a text travels as \036
     # and a stray \037 becomes a blank. The fields, in order:
     #   update_id kind chat_id from_id payload ref message_id reply_to date
-    #   content chat_type chat_label
+    #   content chat_type chat_label file_id file_name mime_type file_size
     # where kind is callback, message, poll_answer or other; payload is the
     # button data, the text or caption, or the chosen poll options; ref is
     # the callback id or the poll id; content is text, photo, sticker,
-    # document, voice, button, poll or other.
+    # document, video, animation, audio, voice, video_note, button, poll or
+    # other; and the last four describe the file of a message that carries
+    # one (the largest size of a photo).
     if have jq; then
         jq -r '
           def clean: tostring | gsub("\u001f"; " ") | gsub("\r?\n"; "\u001e");
+          def media: ((.photo // [] | max_by(.width // 0)) // .animation // .video // .document
+                      // .audio // .voice // .video_note // {});
           .result[]? |
           if .callback_query then
             [.update_id, "callback",
@@ -2985,7 +3029,7 @@ updates_extract() {
              (.callback_query.id // ""),
              (.callback_query.message.message_id // ""), "",
              (.callback_query.message.date // ""), "button",
-             (.callback_query.message.chat.type // ""), ""]
+             (.callback_query.message.chat.type // ""), "", "", "", "", ""]
           elif .message then
             [.update_id, "message",
              (.message.chat.id // ""),
@@ -2995,16 +3039,22 @@ updates_extract() {
              (.message.reply_to_message.message_id // ""),
              (.message.date // ""),
              (if .message.text then "text" elif .message.sticker then "sticker"
-              elif .message.photo then "photo" elif .message.document then "document"
-              elif .message.voice then "voice" else "other" end),
+              elif .message.photo then "photo" elif .message.animation then "animation"
+              elif .message.video then "video" elif .message.document then "document"
+              elif .message.audio then "audio" elif .message.voice then "voice"
+              elif .message.video_note then "video_note" else "other" end),
              (.message.chat.type // ""),
-             (.message.chat.title // .message.chat.username // .message.from.first_name // "" | clean)]
+             (.message.chat.title // .message.chat.username // .message.from.first_name // "" | clean),
+             (.message | media | .file_id // ""),
+             (.message | media | .file_name // "" | clean),
+             (.message | media | .mime_type // ""),
+             (.message | media | .file_size // "")]
           elif .poll_answer then
             [.update_id, "poll_answer", "", (.poll_answer.user.id // ""),
              ((.poll_answer.option_ids // []) | map(tostring) | join(",")),
-             (.poll_answer.poll_id // ""), "", "", "", "poll", "", ""]
+             (.poll_answer.poll_id // ""), "", "", "", "poll", "", "", "", "", "", ""]
           else
-            [.update_id, "other", "", "", "", "", "", "", "", "other", "", ""]
+            [.update_id, "other", "", "", "", "", "", "", "", "other", "", "", "", "", "", ""]
           end | map(tostring) | join("\u001f")'
     else
         python3 -c '
@@ -3018,6 +3068,14 @@ try:
     data = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
+def media(m):
+    photos = m.get("photo") or []
+    if photos:
+        return max(photos, key=lambda p: p.get("width") or 0)
+    for key in ("animation", "video", "document", "audio", "voice", "video_note"):
+        if m.get(key):
+            return m[key]
+    return {}
 for u in data.get("result", []) or []:
     uid = u.get("update_id", "")
     if "callback_query" in u:
@@ -3025,28 +3083,29 @@ for u in data.get("result", []) or []:
         m = c.get("message", {}) or {}
         row = [uid, "callback", (m.get("chat") or {}).get("id"), (c.get("from") or {}).get("id"),
                c.get("data", ""), c.get("id", ""), m.get("message_id"), "", m.get("date"),
-               "button", (m.get("chat") or {}).get("type"), ""]
+               "button", (m.get("chat") or {}).get("type"), "", "", "", "", ""]
     elif "message" in u:
         m = u["message"]
         chat = m.get("chat") or {}
         label = chat.get("title") or chat.get("username") or (m.get("from") or {}).get("first_name", "")
-        if "text" in m: content = "text"
-        elif "sticker" in m: content = "sticker"
-        elif "photo" in m: content = "photo"
-        elif "document" in m: content = "document"
-        elif "voice" in m: content = "voice"
-        else: content = "other"
+        content = "other"
+        for key in ("text", "sticker", "photo", "animation", "video", "document", "audio", "voice", "video_note"):
+            if key in m:
+                content = key
+                break
+        f = media(m)
         row = [uid, "message", chat.get("id"), (m.get("from") or {}).get("id"),
                m.get("text", m.get("caption", "")), "", m.get("message_id"),
                (m.get("reply_to_message") or {}).get("message_id"), m.get("date"),
-               content, chat.get("type"), label]
+               content, chat.get("type"), label,
+               f.get("file_id", ""), f.get("file_name", ""), f.get("mime_type", ""), f.get("file_size", "")]
     elif "poll_answer" in u:
         p = u["poll_answer"]
         row = [uid, "poll_answer", "", (p.get("user") or {}).get("id"),
                ",".join(str(i) for i in p.get("option_ids", [])), p.get("poll_id", ""),
-               "", "", "", "poll", "", ""]
+               "", "", "", "poll", "", "", "", "", "", ""]
     else:
-        row = [uid, "other", "", "", "", "", "", "", "", "other", "", ""]
+        row = [uid, "other", "", "", "", "", "", "", "", "other", "", "", "", "", "", ""]
     print(US.join(clean(x) for x in row))
 '
     fi
@@ -3195,6 +3254,31 @@ waiter_find() {
     return 1
 }
 
+waiter_find_receive() {
+    # waiter_find_receive CHAT CONTENT REPLY_TO MESSAGE_ID -> the nonce of
+    # the live 'receive' of that chat a file belongs to: the one whose
+    # prompt the file answers, else the one whose prompt it directly
+    # follows, else the oldest one waiting for files of that kind.
+    local D w f now best="" best_deadline=0
+    D=$(inbox_dir); now=$(date +%s)
+    for w in "$D"/waiters/*; do
+        [ -f "$w" ] || continue
+        f=()
+        read -r -a f < "$w" 2>/dev/null
+        [ "${#f[@]}" -ge 7 ] || continue
+        [ "${f[3]}" = "receive" ] || continue
+        kill -0 "${f[0]}" 2>/dev/null || continue
+        [ "${f[6]}" -ge "$now" ] 2>/dev/null || continue
+        [ "${f[1]}" = "$1" ] || continue
+        case "${f[4]}" in any|"$2") ;; *) continue ;; esac
+        if [ -n "$3" ] && [ "${f[2]}" = "$3" ]; then basename "$w"; return 0; fi
+        if is_number "$4" && is_number "${f[2]}" && [ "${f[2]}" -eq $(( $4 - 1 )) ]; then basename "$w"; return 0; fi
+        if [ -z "$best" ] || [ "${f[6]}" -lt "$best_deadline" ]; then best=$(basename "$w"); best_deadline=${f[6]}; fi
+    done
+    [ -n "$best" ] || return 1
+    printf '%s' "$best"
+}
+
 inbox_route() {
     # inbox_route KIND CHAT PAYLOAD REF MESSAGE_ID REPLY_TO CONTENT -> where
     # an update goes: the nonce of its question, "pending", "hold" (perhaps
@@ -3215,20 +3299,29 @@ inbox_route() {
                 *) printf 'drop' ;;
             esac ;;
         message)
-            # Commands and messages without text (a sticker) answer nothing.
-            case "$payload" in /*|"") printf 'drop'; return 0 ;; esac
-            [ "$content" = "text" ] || { printf 'drop'; return 0; }
-            if [ -n "$replyto" ]; then
-                if w=$(waiter_find "$chat" 3 "$replyto"); then printf '%s' "$w"
-                elif waiter_find "$chat" 3 pending >/dev/null; then printf 'pending'
-                else printf 'hold'
-                fi
-            elif is_number "$mid" && w=$(waiter_find "$chat" 3 $(( mid - 1 ))) &&
-                 [ "$(cut -d' ' -f6 "$D/waiters/$w")" = "1" ]; then
-                printf '%s' "$w"
-            else
-                printf 'hold'
-            fi ;;
+            case "$content" in
+                text)
+                    # Commands answer nothing.
+                    case "$payload" in /*|"") printf 'drop'; return 0 ;; esac
+                    if [ -n "$replyto" ]; then
+                        if w=$(waiter_find "$chat" 3 "$replyto"); then printf '%s' "$w"
+                        elif waiter_find "$chat" 3 pending >/dev/null; then printf 'pending'
+                        else printf 'hold'
+                        fi
+                    elif is_number "$mid" && w=$(waiter_find "$chat" 3 $(( mid - 1 ))) &&
+                         [ "$(cut -d' ' -f6 "$D/waiters/$w")" = "1" ]; then
+                        printf '%s' "$w"
+                    else
+                        printf 'hold'
+                    fi ;;
+                photo|document|video|animation|audio|voice|video_note)
+                    # A file goes to the 'receive' that waits for one; kept
+                    # otherwise, since one may start on another computer.
+                    if w=$(waiter_find_receive "$chat" "$content" "$replyto" "$mid"); then printf '%s' "$w"
+                    else printf 'hold'
+                    fi ;;
+                *)  printf 'drop' ;;
+            esac ;;
         poll_answer)
             if w=$(waiter_find "" 5 "$ref"); then printf '%s' "$w"; else printf 'hold'; fi ;;
         *)
@@ -3323,7 +3416,15 @@ EOF
         [ "$uid" -gt "$maxuid" ] && maxuid=$uid
         if [ -f "$D/seen/$uid" ]; then
             first=$(cat "$D/seen/$uid" 2>/dev/null || echo "$now")
-            if [ -f "$D/held/$uid" ] && [ $(( now - first )) -lt 600 ] && [ -z "$hold" ]; then hold=$uid; fi
+            if [ -f "$D/held/$uid" ] && [ $(( now - first )) -lt 600 ]; then
+                # A question that started since may claim it: a file sent
+                # before 'receive' began waiting still reaches it.
+                target=$(inbox_route "$kind" "$chat" "$payload" "$ref" "$mid" "$replyto" "$content")
+                case "$target" in
+                    hold|drop|closed|pending) [ -n "$hold" ] || hold=$uid ;;
+                    *) atomic_write "$D/inbox/$uid.$target" "$rec"; rm -f "$D/held/$uid" ;;
+                esac
+            fi
             continue
         fi
         printf '%s' "$now" > "$D/seen/$uid"
@@ -3423,6 +3524,7 @@ updates_check_fatal() {
 # ---------------------------------------------------------------------------
 
 RUN_STOP=""; RUN_LOCK=""; RUN_LIMIT_HIT=""; RUN_LOG_OWN=1; RUN_INTERRUPTED=0
+RUN_ALERTS=(); RUN_ALERT_DIR=""
 readonly RUN_LOG_CAP=47185920      # 45 MiB of log are kept, the end of it
 
 log_tail() {
@@ -3475,19 +3577,56 @@ run_send_stall() {
     deliver "$(build_message)" >/dev/null 2>&1 || true
 }
 
+run_send_alert() {
+    # run_send_alert LABEL PATTERN LINE_NUMBER LOG REPLY_TO: the one message
+    # for a pattern seen in the output, as a new message so that the phone
+    # rings, with the matching line and the few lines before it.
+    local TITLE="$1" LEVEL="warn" META=0 PERCENT="" QUOTE_TEXT="" PROGRESS_INFO="" CODE_LANG=""
+    local BODY CODE_TEXT REPLY_TO="$5" from
+    BODY="the output matched '$2' at line $3:"
+    from=$(( $3 - 4 )); [ "$from" -ge 1 ] || from=1
+    CODE_TEXT=$(sed -n "${from},${3}p" "$4" 2>/dev/null |
+        sed -e "s/$ESC\[[0-9;?]*[A-Za-z]//g" -e "s/.*$CR\(.\)/\1/" -e "s/$CR\$//" | utf8_clean 300)
+    deliver "$(build_message)" >/dev/null 2>&1 || true
+}
+
+run_check_alerts() {
+    # run_check_alerts LOG FROM LABEL REPLY_TO: the lines of the log written
+    # after byte FROM, searched for each --alert pattern not yet seen; the
+    # first line matching a pattern is reported at once, that pattern then
+    # resting for the rest of the run.
+    local log="$1" from="$2" label="$3" reply="$4" i=0 pat rel abs before
+    while [ "$i" -lt "${#RUN_ALERTS[@]}" ]; do
+        pat="${RUN_ALERTS[$i]}"
+        if [ ! -f "$RUN_ALERT_DIR/$i" ]; then
+            rel=$(tail -c +$(( from + 1 )) "$log" 2>/dev/null | grep -n -E -m 1 -- "$pat" 2>/dev/null | cut -d: -f1)
+            if is_number "$rel"; then
+                : > "$RUN_ALERT_DIR/$i"
+                before=$(head -c "$from" "$log" 2>/dev/null | wc -l | tr -d ' ')
+                is_number "$before" || before=0
+                abs=$(( before + rel ))
+                run_send_alert "$label" "$pat" "$abs" "$log" "$reply"
+            fi
+        fi
+        i=$(( i + 1 ))
+    done
+}
+
 run_watcher() {
     # The companion of a run, in the background: it edits the status message
     # every EVERY seconds, warns once when the log has been silent STALL
-    # seconds, keeps the log within its cap, and stops the command at LIMIT
-    # seconds when no 'timeout' can. It works in a folder of its own, since
-    # the request files of api_call would collide with the parent's.
+    # seconds, reports the first line matching each --alert pattern, keeps
+    # the log within its cap, and stops the command at LIMIT seconds when no
+    # 'timeout' can. It works in a folder of its own, since the request
+    # files of api_call would collide with the parent's.
     local parent="$1" log="$2" mid="$3" every="$4" stall="$5" label="$6" start="$7" limit="$8"
-    local pidfile="$9" now size last_size=-1 last_change last_edit stalled=0 tick=5 child
+    local pidfile="$9" now size last_size=-1 last_change last_edit stalled=0 tick=5 child scanned=0
     WORKDIR="$(dirname "$RUN_STOP")/watch"
     mkdir -p "$WORKDIR" || return 0
     { [ "$every" -gt 0 ] && [ "$every" -lt 30 ]; } && tick=1
     { [ "$stall" -gt 0 ] && [ "$stall" -lt 30 ]; } && tick=1
     { [ "$limit" -gt 0 ] && [ "$limit" -lt 30 ]; } && tick=1
+    [ ${#RUN_ALERTS[@]} -gt 0 ] && tick=1
     last_change=$(date +%s); last_edit=$last_change
     while kill -0 "$parent" 2>/dev/null && [ ! -f "$RUN_STOP" ]; do
         sleep "$tick"
@@ -3495,9 +3634,17 @@ run_watcher() {
         now=$(date +%s)
         size=$(file_size "$log"); is_number "$size" || size=0
         if [ "$size" != "$last_size" ]; then last_size=$size; last_change=$now; stalled=0; fi
+        if [ ${#RUN_ALERTS[@]} -gt 0 ]; then
+            [ "$size" -lt "$scanned" ] && scanned=0
+            if [ "$size" -gt "$scanned" ]; then
+                run_check_alerts "$log" "$scanned" "$label" "$mid"
+                scanned=$size
+            fi
+        fi
         if [ "$RUN_LOG_OWN" -eq 1 ] && [ "$size" -gt "$RUN_LOG_CAP" ]; then
             tail -c $(( RUN_LOG_CAP * 9 / 10 )) "$log" > "$log.cut" 2>/dev/null && cat "$log.cut" > "$log"
             rm -f "$log.cut"
+            scanned=0
         fi
         if [ "$stall" -gt 0 ] && [ "$stalled" -eq 0 ] && [ $(( now - last_change )) -ge "$stall" ]; then
             stalled=1
@@ -3553,7 +3700,7 @@ cmd_run() {
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            --label|-l|--tail|--on|--limit|--every|--stall|--log)
+            --label|-l|--tail|--on|--limit|--every|--stall|--log|--alert)
                 [ $# -ge 2 ] || die "$EX_USAGE" "$1 needs a value" ;;
         esac
         case "$1" in
@@ -3566,6 +3713,7 @@ cmd_run() {
             --limit)             limit="$2"; shift 2 ;;
             --every)             every="$2"; shift 2 ;;
             --stall)             stall="$2"; shift 2 ;;
+            --alert)             RUN_ALERTS[${#RUN_ALERTS[@]}]="$2"; shift 2 ;;
             --log)               log_path="$2"; shift 2 ;;
             --attach-log)        attach_log=1; shift ;;
             --attach-log-always) attach_log=2; shift ;;
@@ -3604,6 +3752,12 @@ cmd_run() {
         : > "$log"
     fi
     RUN_STOP="$wd/run.stop"; RUN_LOCK="$wd/run.lock"; RUN_LIMIT_HIT="$wd/run.limit"
+    RUN_ALERT_DIR="$wd/alerts"; mkdir -p "$RUN_ALERT_DIR"
+    local pat
+    for pat in ${RUN_ALERTS[@]+"${RUN_ALERTS[@]}"}; do
+        printf '' | grep -E -- "$pat" >/dev/null 2>&1
+        [ $? -le 1 ] || die "$EX_USAGE" "--alert takes an extended regular expression, and '$pat' is not one"
+    done
 
     # The command runs whatever happens to the notifications.
     if [ "$DISABLED" != "1" ]; then
@@ -3638,7 +3792,8 @@ cmd_run() {
         fi
     fi
     rm -f "$RUN_STOP" "$RUN_LIMIT_HIT"
-    if { [ "$notify" -eq 1 ] && { [ "$every_s" -gt 0 ] || [ "$stall_s" -gt 0 ]; }; } || [ -n "$pidfile" ]; then
+    if { [ "$notify" -eq 1 ] && { [ "$every_s" -gt 0 ] || [ "$stall_s" -gt 0 ] || [ ${#RUN_ALERTS[@]} -gt 0 ]; }; } ||
+       [ -n "$pidfile" ]; then
         ( run_watcher "$$" "$log" "$status_mid" "$every_s" "$stall_s" "$label" "$start" "$limit_s" "$pidfile" ) &
         wpid=$!
     fi
@@ -3702,7 +3857,10 @@ cmd_run() {
             FIELDS[${#FIELDS[@]}]="took=$(human_duration "$elapsed")"
             META=1
             [ -n "$status_mid" ] && REPLY_TO="$status_mid"
-            deliver "$(build_message)" || warn "the notification itself could not be delivered"
+            # A figure named with --photo may be the command's own product:
+            # one that is missing is left out, and the report still goes.
+            ATTACH_LENIENT=1
+            deliver_message || warn "the notification itself could not be delivered"
             [ "$DELIVER_SUPPRESSED" -eq 1 ] && note "the report repeats one sent within --cooldown, it was not sent"
             if [ "$attach_log" -eq 2 ] || { [ "$attach_log" -eq 1 ] && [ "$rc" -ne 0 ]; }; then
                 run_attach_log "$log" "$label"
@@ -3831,13 +3989,16 @@ EOF
             case "$action" in start|update) LEVEL="progress" ;; *) LEVEL="success" ;; esac
         fi
         PROGRESS_INFO=$(progress_timing start "$start" "$expected")
-        deliver "$(build_message)" || finish_failure $?
-        mid=$(json_get "$API_BODY" "result.message_id")
         case "$action" in
             start|update)
+                deliver "$(build_message)" || finish_failure $?
+                mid=$(json_get "$API_BODY" "result.message_id")
                 [ "$DRY_RUN" -eq 1 ] || atomic_write "$slot" "$mid $start $expected $FORMAT" || true
-                [ "$action" = "start" ] && send_formula_reply "$mid"
+                # Pictures and formulas follow as a reply: the message is
+                # edited later and an edited text cannot carry them.
+                send_attachments_reply "$mid"
                 [ "$action" = "start" ] && [ "$JSON_OUT" -eq 0 ] && printf '%s\n' "$mid" ;;
+            *)  deliver_message || finish_failure $? ;;
         esac
         exit "$EX_OK"
     fi
@@ -3882,12 +4043,16 @@ EOF
         done|finish|end)
             [ "$DRY_RUN" -eq 1 ] || rm -f "$slot"
             # An edit never rings the phone: the end is announced by a short
-            # reply to the progress message, unless --edit-only.
+            # reply to the progress message, unless --edit-only. The reply
+            # carries the pictures and formulas given with it.
             if [ "$EDIT_ONLY" -eq 0 ]; then
                 PERCENT=""; CODE_TEXT=""; QUOTE_TEXT=""; ITEMS=(); FIELDS=(); BUTTONS=()
                 REPLY_TO="$mid"
-                deliver "$(build_message)" || warn "the final reply could not be sent"
+                deliver_message || warn "the final reply could not be sent"
+            else
+                send_attachments_reply "$mid"
             fi ;;
+        *)  send_attachments_reply "$mid" ;;
     esac
     exit "$EX_OK"
 }
@@ -3951,20 +4116,36 @@ cmd_ask() {
     [ "$ASK_FREE_TEXT" -eq 1 ] && KEYBOARD_FORCE_REPLY=1
     [ -n "$LEVEL" ] || LEVEL="question"
     deadline=$(( $(date +%s) + wait_total ))
+    json_out="$JSON_OUT"; JSON_OUT=0     # stdout carries the answer alone
+
+    # The formulas and the pictures go first, as an album the question
+    # answers, so that the buttons sit right under the question.
+    attachments_prepare classic
+    if [ ${#MP[@]} -gt 0 ]; then
+        MEDIA_KEYBOARD=0
+        attachment_captions ""
+        if send_media_set; then
+            if [ -z "$REPLY_TO" ] && is_number "$MEDIA_FIRST_MID" && [ "$MEDIA_FIRST_MID" != "0" ]; then
+                REPLY_TO="$MEDIA_FIRST_MID"
+            fi
+        else
+            warn "the pictures of the question could not be sent"
+        fi
+        MEDIA_KEYBOARD=1
+    fi
 
     if [ "$DRY_RUN" -eq 1 ]; then
         deliver "$(build_message)" || true
+        JSON_OUT="$json_out"
         [ -n "$ASK_DEFAULT" ] && ask_print "$ASK_DEFAULT" default
         exit "$EX_OK"
     fi
 
     waiter_register "$nonce" ask - "$ASK_FREE_TEXT" "$deadline"
-    json_out="$JSON_OUT"; JSON_OUT=0     # stdout carries the answer alone
     deliver "$(build_message)" || { rc=$?; JSON_OUT="$json_out"; finish_failure "$rc"; }
     JSON_OUT="$json_out"
     mid=$(json_get "$API_BODY" "result.message_id")
     waiter_set 3 "$mid"
-    send_formula_reply "$mid"
     note "waiting up to $(human_duration "$wait_total") for an answer"
 
     rec=$(inbox_wait "$nonce" "$deadline")
@@ -4078,6 +4259,197 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# receive: a file sent from the phone, saved here
+# ---------------------------------------------------------------------------
+
+api_download() {
+    # api_download FILE_ID OUT: the file Telegram holds under that id, saved
+    # as OUT. The token travels in the curl configuration, as in every
+    # request. Returns 0, or an EX_* code with API_ERROR set.
+    local path wd cfg rc http attempt=0 delay
+    req_reset
+    req_add file_id "$1"
+    api_call getFile || return $?
+    path=$(json_get "$API_BODY" "result.file_path")
+    [ -n "$path" ] || { API_ERROR="Telegram gave no path for the file"; return "$EX_API"; }
+    wd=$(workdir); cfg="$wd/curl.cfg"
+    while :; do
+        attempt=$(( attempt + 1 ))
+        ( umask 077
+          { printf 'url = "%s/file/bot%s/%s"\n' "$(printf '%s' "$API_ROOT" | curl_conf_escape)" "$TOKEN" \
+                "$(printf '%s' "$path" | curl_conf_escape)"
+            printf 'silent\nshow-error\nlocation\nfail\n'
+            printf 'connect-timeout = %s\nspeed-limit = 1024\nspeed-time = 60\n' "$TIMEOUT"
+            printf 'user-agent = "%s/%s"\n' "$TG_PING_NAME" "$TG_PING_VERSION"
+            [ "$INSECURE" -eq 1 ] && printf 'insecure\n'
+            printf 'output = "%s"\n' "$(printf '%s' "$2" | curl_conf_escape)"
+            printf 'write-out = "%%{http_code}"\n'; } > "$cfg" )
+        http=$(curl --config "$cfg" 2>"$wd/curl.err" 8>&-); rc=$?
+        rm -f "$cfg"
+        [ "$rc" -eq 0 ] && [ -s "$2" ] && return 0
+        API_ERROR="the download failed: $(tr -d '\n' < "$wd/curl.err" | redact)"
+        rm -f "$2"
+        case "$http" in 4*|5*) return "$EX_API" ;; esac
+        if [ "$attempt" -le "$RETRIES" ]; then
+            delay=$(( attempt * attempt ))
+            note "$API_ERROR, retrying in ${delay}s (attempt $attempt of $RETRIES)"
+            sleep "$delay"; continue
+        fi
+        return "$EX_NET"
+    done
+}
+
+receive_destination() {
+    # receive_destination OUT CONTENT NAME MIME -> where a received file is
+    # saved: inside OUT when it is a folder (or ends with a slash), else as
+    # OUT itself. A document keeps its own name, a photo is called after its
+    # kind and the time, and an existing file is never overwritten.
+    local out="$1" content="$2" name="$3" mime="$4" dir ext base n candidate
+    name=$(printf '%s' "$name" | tr -d '\000-\037' | tr '/\134' '__')
+    case "$name" in .|..) name="" ;; esac
+    if [ -z "$name" ]; then
+        case "$mime" in
+            image/png)       ext=png ;;
+            image/jpeg)      ext=jpg ;;
+            image/webp)      ext=webp ;;
+            application/pdf) ext=pdf ;;
+            text/plain)      ext=txt ;;
+            audio/ogg)       ext=oga ;;
+            audio/mpeg)      ext=mp3 ;;
+            video/mp4)       ext=mp4 ;;
+            *) case "$content" in
+                   photo)                     ext=jpg ;;
+                   voice)                     ext=oga ;;
+                   audio)                     ext=mp3 ;;
+                   video|animation|video_note) ext=mp4 ;;
+                   *)                         ext=bin ;;
+               esac ;;
+        esac
+        name="$content-$(date '+%Y%m%d-%H%M%S').$ext"
+    fi
+    case "$out" in
+        */) dir="${out%/}"; [ -n "$dir" ] || dir="/" ;;
+        *)  if [ -d "$out" ]; then dir="$out"; else dir=$(dirname "$out"); name=$(basename "$out"); fi ;;
+    esac
+    [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || die "$EX_USAGE" "cannot create the folder $dir"
+    candidate="$dir/$name"; n=1
+    while [ -e "$candidate" ]; do
+        n=$(( n + 1 ))
+        case "$name" in
+            ?*.*) base=${name%.*}; ext=${name##*.}; candidate="$dir/$base-$n.$ext" ;;
+            *)    candidate="$dir/$name-$n" ;;
+        esac
+    done
+    printf '%s' "$candidate"
+}
+
+cmd_receive() {
+    # cmd_receive [PROMPT]: a file sent from the phone (a photo, a document,
+    # a voice note) saved here under its name, the path printed. With a
+    # prompt, the question goes out first and the file that answers it is
+    # taken; without one, the next file of the chat, or one sent in the last
+    # ten minutes that nobody claimed.
+    parse_common_args "$@"
+    [ "$HELP_REQUESTED" -eq 1 ] && { help_receive; exit "$EX_OK"; }
+    local wait_total="${ASK_TIMEOUT:-300}" nonce deadline mid="" rec rc out json_out dest full
+    local chat payload rmid content fid fname mime fsize record
+    body_from_remaining
+    is_number "$wait_total" || wait_total=$(parse_duration "$wait_total") ||
+        die "$EX_USAGE" "--wait takes seconds, or a duration such as 15m"
+    case "$RECEIVE_KIND" in
+        any|photo|document|video|animation|audio|voice|video_note) ;;
+        *) die "$EX_USAGE" "--kind takes photo, document, video, animation, audio, voice, video_note or any" ;;
+    esac
+    out="${MATH_OUT:-.}"
+    if [ "$DISABLED" = "1" ]; then
+        printf '%s: nothing can be received while TG_PING_DISABLED is set\n' "$TG_PING_NAME" >&2
+        exit "$EX_TIMEOUT"
+    fi
+    need_json_reader receive
+    require_credentials
+    CHATS_CURRENT=$(chat_list | head -n1)
+    if [ "$(chat_list | wc -l)" -gt 1 ]; then
+        warn "'receive' listens to one chat, using $CHATS_CURRENT"
+        CHATS="$CHATS_CURRENT"
+    fi
+    nonce="$(machine_mark)$(random_tail)"
+    deadline=$(( $(date +%s) + wait_total ))
+    json_out="$JSON_OUT"; JSON_OUT=0     # stdout carries the path alone
+
+    if [ -n "$BODY" ]; then
+        # The prompt opens the reply field, so that the file answers it.
+        [ -n "$LEVEL" ] || LEVEL="question"
+        BUTTONS=(); KEYBOARD_FORCE_REPLY=1
+        if [ "$DRY_RUN" -eq 1 ]; then
+            deliver "$(build_message)" || true
+            exit "$EX_OK"
+        fi
+        waiter_register "$nonce" receive "$RECEIVE_KIND" 0 "$deadline"
+        deliver "$(build_message)" || { rc=$?; JSON_OUT="$json_out"; finish_failure "$rc"; }
+        mid=$(json_get "$API_BODY" "result.message_id")
+        waiter_set 3 "$mid"
+    else
+        [ "$DRY_RUN" -eq 1 ] && { msg "dry run: nothing is received"; exit "$EX_OK"; }
+        waiter_register "$nonce" receive "$RECEIVE_KIND" 0 "$deadline"
+        waiter_set 3 open
+    fi
+    note "waiting up to $(human_duration "$wait_total") for a file"
+
+    rec=$(inbox_wait "$nonce" "$deadline")
+    updates_check_fatal
+    rm -f "$INBOX_WAITER"; INBOX_WAITER=""
+    if [ -z "$rec" ]; then
+        printf '%s: no file arrived within %s\n' "$TG_PING_NAME" "$(human_duration "$wait_total")" >&2
+        exit "$EX_TIMEOUT"
+    fi
+    IFS="$US" read -r _ _ chat _ payload _ rmid _ _ content _ _ fid fname mime fsize <<EOF
+$rec
+EOF
+    [ -n "$fid" ] || die "$EX_API" "the message carries no file Telegram can hand over"
+    dest=$(receive_destination "$out" "$content" "$fname" "$mime")
+    if ! api_download "$fid" "$dest"; then
+        rc=$?
+        case "$API_ERROR" in
+            *"too big"*|*"too large"*)
+                die "$rc" "$API_ERROR
+  Telegram lets a bot download files of up to 20 MB. Send a smaller file, or a link to it." ;;
+        esac
+        die "$rc" "$(api_explain "$API_ERROR")"
+    fi
+    full="$(cd "$(dirname "$dest")" && pwd)/$(basename "$dest")"
+    note "received $content $(basename "$dest") ($(file_size "$dest") bytes)"
+
+    # A quiet acknowledgement under the file, and the prompt records it.
+    req_reset
+    req_add chat_id "$chat"
+    req_add message_id "$rmid"
+    req_add reaction '[{"type":"emoji","emoji":"👍"}]'
+    api_call setMessageReaction >/dev/null 2>&1 || true
+    if is_number "$mid" && [ "$mid" != "0" ]; then
+        BUTTONS=(); KEYBOARD_FORCE_REPLY=0
+        if [ "$FORMAT" = "rich" ]; then
+            record="$(build_message)<p>$(fmt_italic "received: $(basename "$dest")")</p>"
+        else
+            record="$(build_message)
+$(fmt_italic "received: $(basename "$dest")")"
+        fi
+        edit_request "$CHATS_CURRENT" "$mid" "$record"
+        api_call editMessageText >/dev/null 2>&1 || true
+    fi
+
+    JSON_OUT="$json_out"
+    if [ "$JSON_OUT" -eq 1 ]; then
+        printf '{"path":"%s","kind":"%s","name":"%s","caption":"%s","size":%s}\n' \
+            "$(printf '%s' "$full" | json_escape)" "$content" \
+            "$(printf '%s' "$(basename "$dest")" | json_escape)" \
+            "$(printf '%s' "$payload" | tr '\036' '\n' | json_escape)" "${fsize:-0}"
+    else
+        printf '%s\n' "$full"
+    fi
+    exit "$EX_OK"
+}
+
+# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
@@ -4089,7 +4461,7 @@ VALUE_OPTS=" -m --message --text -t --title -L --level --emoji --item --field --
  --reply-to --topic --thread --chat -c --token --token-file --profile -P --env-file --config --api
  --timeout --retries --cooldown --key --id --max-parts --caption --name --as --dpi --bg --background
  --out --preamble --sep --separator --wait --default --correct --each --math --file --pages
- --expected --label -l --tail --on --limit --every --stall --log "
+ --expected --photo --document --kind --label -l --tail --on --limit --every --stall --log --alert "
 VALUE_OPTS=$(printf '%s' "$VALUE_OPTS" | tr '\n' ' ')
 
 # Every option without a value, those of 'run' included. The completions are
@@ -4119,6 +4491,7 @@ progress:keep one message up to date
 wait:report when a running process ends
 ask:ask a question and wait for the answer
 poll:send a poll
+receive:wait for a file sent from the phone and save it
 edit:correct a message already sent
 delete:withdraw a message already sent
 init:set up the bot and the chat
@@ -4132,7 +4505,7 @@ version:print the version
 help:help on a command"
 
 # Commands that take arguments: written after options, they are still found.
-HOISTABLE=" code table math photo file media pdf rich run progress ask poll edit delete wait "
+HOISTABLE=" code table math photo file media pdf rich run progress ask poll receive edit delete wait "
 
 OPTIONS=(); REMAINING=(); EACH=(); MATH_LIST=()
 CAPTION=""; MEDIA_AS="auto"; MEDIA_NAME=""; MEDIA_ORIGINAL=0; MEDIA_REPLACE=0
@@ -4146,6 +4519,7 @@ CHATS_CURRENT=""; PROGRESS_ID=""; PROGRESS_KEY=""; PROGRESS_EXPECTED=""
 ASK_TIMEOUT=300; ASK_DEFAULT=""; ASK_FREE_TEXT=1; ASK_COLS=2; ANSWER_KIND=""
 POLL_WAIT=0; POLL_MULTI=0; POLL_ANONYMOUS="false"; POLL_CORRECT=""
 PDF_PAGES=""; PDF_ATTACH=0; PDF_DPI=""; USE_LAST=0; EDIT_ONLY=0; WAIT_LABEL=""; WAIT_LOG=""
+RECEIVE_KIND="any"
 NO_STDIN=$(bool01 "${TG_PING_NO_STDIN:-0}")
 CAPTION_OVERFLOW=""; CAPTION_TEXT=""
 
@@ -4163,6 +4537,7 @@ need_readable() {
 }
 
 parse_common_args() {
+    local label target
     REMAINING=()
     while [ $# -gt 0 ]; do
         case "$VALUE_OPTS" in
@@ -4193,7 +4568,14 @@ parse_common_args() {
             --collapse)           COLLAPSE=1; shift ;;
             --percent)            PERCENT="$2"; shift 2 ;;
             --button)             case "$2" in *=*) ;; *) die "$EX_USAGE" "--button expects \"Label=https://address\"" ;; esac
-                                  BUTTONS[${#BUTTONS[@]}]="url$US${2%%=*}$US${2#*=}"; shift 2 ;;
+                                  # The label ends where the address begins, so that a
+                                  # label may hold an equals sign of its own.
+                                  target="$2"; label=""
+                                  while case "$target" in http://*|https://*|tg://*) false ;; *=*) true ;; *) false ;; esac; do
+                                      label="${label:+$label=}${target%%=*}"; target=${target#*=}
+                                  done
+                                  [ -n "$label" ] && [ -n "$target" ] || die "$EX_USAGE" "--button expects \"Label=https://address\""
+                                  BUTTONS[${#BUTTONS[@]}]="url$US$label$US$target"; shift 2 ;;
             --cols)               BUTTON_COLS="$2"; ASK_COLS="$2"; shift 2 ;;
             --option|-o)          OPTIONS[${#OPTIONS[@]}]="$2"; shift 2 ;;
             --meta)               META=1; shift ;;
@@ -4207,7 +4589,11 @@ parse_common_args() {
             --silent|-s)          SILENT=1; shift ;;
             --pin)                PIN=1; shift ;;
             --protect)            PROTECT=1; shift ;;
-            --reply-to)           REPLY_TO="$2"; shift 2 ;;
+            --reply-to)           case "$2" in
+                                      last) ;;
+                                      *) is_number "$2" || die "$EX_USAGE" "--reply-to takes the number of a message, or 'last' for the last one this project sent" ;;
+                                  esac
+                                  REPLY_TO="$2"; shift 2 ;;
             --topic|--thread)     THREAD_ID="$2"; shift 2 ;;
             --preview)            NO_PREVIEW=0; shift ;;
             --no-preview)         NO_PREVIEW=1; shift ;;
@@ -4260,6 +4646,9 @@ parse_common_args() {
             --no-stdin)           NO_STDIN=1; shift ;;
             --each)               EACH[${#EACH[@]}]="$2"; shift 2 ;;
             --math)               MATH_LIST[${#MATH_LIST[@]}]="$2"; shift 2 ;;
+            --photo)              ATTACH_PHOTOS[${#ATTACH_PHOTOS[@]}]="$2"; shift 2 ;;
+            --document)           ATTACH_DOCS[${#ATTACH_DOCS[@]}]="$2"; shift 2 ;;
+            --kind)               RECEIVE_KIND=$(lc "$2"); shift 2 ;;
             --prose)              MATH_PROSE=1; shift ;;
             --native)             MATH_NATIVE=1; shift ;;
             --file)               need_readable "$2"; MATH_FILE="$2"; shift 2 ;;
@@ -4295,6 +4684,19 @@ join_remaining() {
     printf '%s' "$out"
 }
 
+body_from_remaining() {
+    # The body is the text left on the command line, unless -m gave one, in
+    # which case the words left over are not silently dropped.
+    local rest
+    if [ -n "$BODY" ]; then
+        rest=$(join_remaining)
+        [ -n "$rest" ] && [ "$rest" != "-" ] &&
+            warn "the words '$rest' are not sent: the body was given with -m (give the text once, or put it after --)"
+        return 0
+    fi
+    BODY=$(join_remaining)
+}
+
 # ---------------------------------------------------------------------------
 # Commands: text, code, tables, media, mathematics
 # ---------------------------------------------------------------------------
@@ -4302,15 +4704,11 @@ join_remaining() {
 cmd_send() {
     parse_common_args "$@"
     [ "${HELP_REQUESTED:-0}" -eq 1 ] && { help_send; exit "$EX_OK"; }
-    [ -n "$BODY" ] || BODY=$(join_remaining)
+    body_from_remaining
     read_stdin_if_piped
     require_credentials
-    if [ ${#MATH_LIST[@]} -gt 0 ] && [ "$FORMAT" != "rich" ]; then
-        send_with_formulas || finish_failure $?
-        exit "$EX_OK"
-    fi
-    deliver "$(build_message)"
-    exit $?
+    deliver_message || finish_failure $?
+    exit "$EX_OK"
 }
 
 language_for_extension() {
@@ -4358,6 +4756,10 @@ cmd_code() {
         content=$(cat)
     fi
     [ -n "$content" ] || die "$EX_USAGE" "no code to send"
+    case "$MEDIA_AS" in
+        auto|message|document) ;;
+        *) die "$EX_USAGE" "'code' sends a snippet --as message or --as document, not '$MEDIA_AS'" ;;
+    esac
     require_credentials
     CHATS_CURRENT=$(chat_list | head -n1)
 
@@ -4454,14 +4856,14 @@ media_kind() {
     esac
 }
 
-RASTER_PATH=""
+RASTER_PATH=""; RASTER_ERROR=""
 
 rasterise_figure() {
     # rasterise_figure PATH: a picture of a vector figure (the first page of a
-    # PDF, an SVG, an EPS) at 300 dpi on white, in RASTER_PATH. Must run in
-    # the main shell.
+    # PDF, an SVG, an EPS) at 300 dpi on white, in RASTER_PATH; fails with
+    # the reason in RASTER_ERROR. Must run in the main shell.
     local path="$1" ext d base out dpi=300
-    [ -r "$path" ] || die "$EX_USAGE" "cannot read $path"
+    [ -r "$path" ] || { RASTER_ERROR="cannot read $path"; return 1; }
     ext=$(lc "${path##*.}")
     d=$(mktemp -d "$(workdir)/figure.XXXXXX") || die "$EX_FAIL" "cannot create a temporary folder"
     base="$d/$(printf '%s' "$(basename "${path%.*}")" | tr -c 'A-Za-z0-9._-' '_')"
@@ -4492,9 +4894,12 @@ rasterise_figure() {
                     --export-background-opacity=1 --export-filename="$out" >"$d/log" 2>&1
             fi ;;
     esac
-    [ -s "$out" ] || die "$EX_FAIL" "could not turn $path into a picture.
+    if [ ! -s "$out" ]; then
+        RASTER_ERROR="could not turn $path into a picture.
   Install poppler-utils for PDF figures, inkscape for SVG, or imagemagick, or send it with 'file'.
 $(tail -n 5 "$d/log" 2>/dev/null)"
+        return 1
+    fi
     RASTER_PATH="$out"
 }
 
@@ -4619,7 +5024,7 @@ cmd_media() {
     for arg in "${files[@]}"; do
         kind=$(media_kind "$arg" "$default")
         if [ "$kind" = "figure" ]; then
-            rasterise_figure "$arg"
+            rasterise_figure "$arg" || die "$EX_FAIL" "$RASTER_ERROR"
             originals[${#originals[@]}]="$arg"
             arg="$RASTER_PATH"; kind="photo"
         elif [ "$kind" = "photo" ] && ! is_remote_ref "$arg"; then
@@ -4672,51 +5077,152 @@ formula_image() {
     [ -s "$png" ]
 }
 
-send_with_formulas() {
-    # A message with its --math formulas in the classic form: the formulas
-    # are drawn into one picture, which carries the text as its caption when
-    # the text fits, and otherwise follows the text as its reply. Without a
-    # renderer the formulas travel as their source, inside the message.
-    local png text chat mid saved_chats saved_reply
-    png="$(workdir)/formulas.png"
-    if ! formula_image "$png"; then
-        warn "the formulas could not be drawn here, they travel as their LaTeX source"
-        MATH_AS_CODE=1
+# The pictures and documents that travel with a message (--photo, --document),
+# and whether they have been prepared yet.
+ATTACH_PHOTOS=(); ATTACH_DOCS=(); ATTACH_READY=0; ATTACH_LENIENT=0
+
+attachments_prepare() {
+    # attachments_prepare classic|rich: fill MP, MK and ITEM_CAPTION with
+    # the files that travel with the message: the --math formulas drawn into
+    # one picture (in the classic form, when a renderer can draw them), then
+    # each --photo (a vector figure drawn first) and each --document. In the
+    # rich mode the files are also listed for the rich message, which embeds
+    # them. Runs once. With ATTACH_LENIENT=1 a file that cannot be read is
+    # left out with a warning rather than stopping the command, since the
+    # report of 'run' must go out whatever happened to the figure.
+    local mode="${1:-classic}" png f kind i id t sep=""
+    [ "$ATTACH_READY" -eq 1 ] && return 0
+    ATTACH_READY=1
+    MP=(); MK=(); ITEM_CAPTION=(); RICH_FILES=(); RICH_MEDIA_JSON=""
+    if [ ${#MATH_LIST[@]} -gt 0 ] && [ "$FORMAT" != "rich" ]; then
+        png="$(workdir)/formulas.png"
+        if formula_image "$png"; then
+            MP[${#MP[@]}]="$png"; MK[${#MK[@]}]="photo"; ITEM_CAPTION[${#ITEM_CAPTION[@]}]=""
+        else
+            warn "the formulas could not be drawn here, they travel as their LaTeX source"
+            MATH_AS_CODE=1
+        fi
+    fi
+    for f in ${ATTACH_PHOTOS[@]+"${ATTACH_PHOTOS[@]}"}; do
+        if [ "$ATTACH_LENIENT" -eq 1 ] && ! is_remote_ref "$f" &&
+           { [ ! -r "$f" ] || [ "$(file_size "$f")" -gt "$TG_UPLOAD_LIMIT" ]; }; then
+            warn "the picture $f cannot be read or is too large, it is left out"; continue
+        fi
+        kind=$(media_kind "$f" photo)
+        if [ "$kind" = "figure" ]; then
+            if rasterise_figure "$f"; then f="$RASTER_PATH"; kind="photo"
+            elif [ "$ATTACH_LENIENT" -eq 1 ]; then warn "$RASTER_ERROR"; continue
+            else die "$EX_FAIL" "$RASTER_ERROR"
+            fi
+        fi
+        prepare_upload "$f" "$kind"
+        MP[${#MP[@]}]="$UPLOAD_PATH"; MK[${#MK[@]}]="$UPLOAD_KIND"; ITEM_CAPTION[${#ITEM_CAPTION[@]}]=""
+    done
+    for f in ${ATTACH_DOCS[@]+"${ATTACH_DOCS[@]}"}; do
+        if [ "$ATTACH_LENIENT" -eq 1 ] && ! is_remote_ref "$f" &&
+           { [ ! -r "$f" ] || [ "$(file_size "$f")" -gt "$TG_UPLOAD_LIMIT" ]; }; then
+            warn "the document $f cannot be read or is too large, it is left out"; continue
+        fi
+        prepare_upload "$f" document
+        MP[${#MP[@]}]="$UPLOAD_PATH"; MK[${#MK[@]}]="document"; ITEM_CAPTION[${#ITEM_CAPTION[@]}]=""
+    done
+    [ "$mode" = "rich" ] || return 0
+    i=0
+    while [ "$i" -lt "${#MP[@]}" ]; do
+        id="a$(( i + 1 ))"; t="${MK[$i]}"
+        RICH_MEDIA_JSON="$RICH_MEDIA_JSON$sep{\"id\":\"$id\",\"media\":{\"type\":\"$t\",\"media\":\"attach://$id\"}}"
+        sep=","
+        RICH_FILES[${#RICH_FILES[@]}]="$id=$(_safe_path "${MP[$i]}")"
+        i=$(( i + 1 ))
+    done
+    [ -n "$RICH_MEDIA_JSON" ] && RICH_MEDIA_JSON="[$RICH_MEDIA_JSON]"
+    return 0
+}
+
+attachment_captions() {
+    # attachment_captions FIRST: the caption of each file of MP: FIRST for
+    # the first one, and the --each lines, one per file.
+    local i=0 cap
+    while [ "$i" -lt "${#MP[@]}" ]; do
+        cap=""
+        [ "$i" -eq 0 ] && cap="$1"
+        if [ "$i" -lt "${#EACH[@]}" ]; then
+            cap=$(cut_caption "${cap:+$cap
+}$(format_text "${EACH[$i]}")")
+        fi
+        ITEM_CAPTION[i]="$cap"
+        i=$(( i + 1 ))
+    done
+}
+
+send_with_attachments() {
+    # The message with its formulas, pictures and documents in the classic
+    # form: the files carry the text as their caption when it fits and the
+    # buttons can ride along (an album takes none), and otherwise the text
+    # goes first and the files follow as its reply.
+    local text chat mid saved_chats saved_reply rc
+    attachments_prepare classic
+    if [ ${#MP[@]} -eq 0 ]; then
         deliver "$(build_message)"
         return $?
     fi
     text=$(build_message)
     caption_split "$text"
+    if [ -n "$CAPTION_OVERFLOW" ] || { [ ${#BUTTONS[@]} -gt 0 ] && [ ${#MP[@]} -gt 1 ]; }; then
+        for chat in $(chat_list); do
+            saved_chats="$CHATS"; CHATS="$chat"
+            deliver "$text"; rc=$?
+            CHATS="$saved_chats"
+            [ "$rc" -eq 0 ] || return "$rc"
+            [ "$DELIVER_SUPPRESSED" -eq 1 ] && return 0
+            mid=$(json_get "$API_BODY" "result.message_id")
+            CHATS_CURRENT="$chat"; saved_reply="$REPLY_TO"; REPLY_TO="$mid"; MEDIA_KEYBOARD=0
+            attachment_captions ""
+            send_media_set || warn "the attachments could not be sent"
+            REPLY_TO="$saved_reply"; MEDIA_KEYBOARD=1
+        done
+        return 0
+    fi
+    if ! cooldown_allows "$text"; then
+        DELIVER_SUPPRESSED=1
+        return 0
+    fi
+    [ "$TEE" -eq 1 ] && printf '%s\n' "$(printf '%s' "$text" | markup_strip)" >&2
+    attachment_captions "$CAPTION_TEXT"
     for chat in $(chat_list); do
         CHATS_CURRENT="$chat"
-        if [ -z "$CAPTION_OVERFLOW" ]; then
-            send_media_file sendPhoto photo "$png" "$CAPTION_TEXT" "" || return $?
-        else
-            saved_chats="$CHATS"; CHATS="$chat"
-            deliver "$text" || { CHATS="$saved_chats"; return 1; }
-            CHATS="$saved_chats"
-            mid=$(json_get "$API_BODY" "result.message_id")
-            saved_reply="$REPLY_TO"; REPLY_TO="$mid"; MEDIA_KEYBOARD=0
-            send_media_file sendPhoto photo "$png" "" "" || warn "the picture of the formulas could not be sent"
-            REPLY_TO="$saved_reply"; MEDIA_KEYBOARD=1
-        fi
+        send_media_set || return $?
+        [ "$PIN" -eq 1 ] && pin_message "$chat" "$MEDIA_FIRST_MID"
     done
+    cooldown_record "$text"
     return 0
 }
 
-send_formula_reply() {
-    # send_formula_reply MESSAGE_ID: the --math formulas of a question or of
-    # a progress message, drawn into one picture and sent as its reply, since
-    # an edited text cannot become a picture. The rich format needs none.
-    [ ${#MATH_LIST[@]} -gt 0 ] || return 0
-    [ "$FORMAT" = "rich" ] && return 0
-    local png saved_reply="$REPLY_TO"
-    png="$(workdir)/formulas.png"
-    formula_image "$png" || { warn "the formulas could not be drawn here"; return 0; }
+send_attachments_reply() {
+    # send_attachments_reply MESSAGE_ID: the formulas, pictures and documents
+    # of a message that cannot carry them itself (a progress message, which
+    # is edited later), sent as its reply. In the rich format the formulas
+    # are typeset in the message and only the files follow.
+    local saved_reply="$REPLY_TO"
+    attachments_prepare classic
+    [ ${#MP[@]} -gt 0 ] || return 0
     REPLY_TO="$1"; MEDIA_KEYBOARD=0
-    send_media_file sendPhoto photo "$png" "" "" >/dev/null || warn "the picture of the formulas could not be sent"
+    attachment_captions ""
+    send_media_set >/dev/null || warn "the attachments could not be sent"
     REPLY_TO="$saved_reply"; MEDIA_KEYBOARD=1
     return 0
+}
+
+deliver_message() {
+    # The composed message to every chat, formulas and attachments included:
+    # a rich message embeds them, the classic form carries them as captions
+    # or sends them as a reply.
+    if [ "$FORMAT" = "rich" ]; then
+        attachments_prepare rich
+        deliver "$(build_message)"
+        return $?
+    fi
+    send_with_attachments
 }
 
 cmd_math() {
@@ -4801,7 +5307,7 @@ cmd_edit() {
     require_credentials
     CHATS_CURRENT=$(chat_list | head -n1)
     message_target
-    [ -n "$BODY" ] || BODY=$(join_remaining)
+    body_from_remaining
     read_stdin_if_piped
     edit_request "$CHATS_CURRENT" "$TARGET_MID" "$(build_message)"
     req_add reply_markup "$(buttons_json || true)"
@@ -4896,7 +5402,8 @@ cmd_wait() {
     if [ -n "$WAIT_LOG" ]; then
         CODE_TEXT=$(log_tail "$RUN_TAIL" "$WAIT_LOG"); CODE_LANG=""
     fi
-    deliver "$(build_message)" || finish_failure $?
+    ATTACH_LENIENT=1
+    deliver_message || finish_failure $?
     exit "$EX_OK"
 }
 
@@ -4974,7 +5481,7 @@ cmd_rich() {
         case "$path" in /*) ;; *) path="$dir/$path" ;; esac
         [ -f "$path" ] || die "$EX_USAGE" "the report shows $path, which does not exist"
         case "$(lc "${path##*.}")" in
-            pdf|svg|eps|ps) rasterise_figure "$path"; path="$RASTER_PATH" ;;
+            pdf|svg|eps|ps) rasterise_figure "$path" || die "$EX_FAIL" "$RASTER_ERROR"; path="$RASTER_PATH" ;;
         esac
         prepare_upload "$path" "$kind"
         t="$UPLOAD_KIND"
@@ -5554,15 +6061,19 @@ over a stream of small updates.
 ```bash
 tg-ping --ok    --title "Tests green" "142 passed in 38s"
 tg-ping --fail  --title "Build broke" --code-file /tmp/build.log --lang text
+tg-ping --ok    --title "Figure ready" "The spectrum is real." --photo figures/spectrum.pdf
 tg-ping photo   figures/convergence.pdf --caption "Second order confirmed"
 tg-ping math    '\lambda_1 = \pi^2/4' --caption "First eigenvalue"
 tg-ping pdf     paper.pdf --pages 7-8 --caption "The corrected section"
-tg-ping run --label "full test suite" --every 30m --stall 20m -- make test
+tg-ping run --label "full test suite" --every 30m --stall 20m --alert 'NaN|Error' -- make test
 answer=$(tg-ping ask "Continue with the refactor?" -o yes -o no --wait 900)
+answer=$(tg-ping ask "Which figure?" --photo a.png --photo b.png -o left -o right --wait 900)
+file=$(tg-ping receive "Please send the PDF of the paper" --wait 15m --out inbox/)
 ```
 
 Add `--dry-run` to see the request without sending it. Questions asked from
-several sessions at once never mix their answers.
+several sessions at once never mix their answers. `receive` saves a file the
+user sends from the phone and prints its path.
 
 Never print or echo the bot token. Never pass `--token` on the command line.
 EOS
@@ -5730,6 +6241,7 @@ tg-ping cheat sheet
   tg-ping --item "step one done" --item "step two running"
   tg-ping --field "error=1.4e-8" --field "runs=512"
   tg-ping --ok --title "Lemma closed" "text" --math 'E(t) \leqslant E(0)'
+  tg-ping --ok --title "Figure ready" "text" --photo fig.pdf --document data.csv
   tg-ping photo fig.pdf --caption "Convergence"          PDF, SVG, EPS drawn first
   tg-ping photo a.png b.png --caption "Sweep" --each "a" --each "b"
   tg-ping photo res.png --key res --replace              live figure
@@ -5739,16 +6251,18 @@ tg-ping cheat sheet
   tg-ping code solver.py --lang python
   tg-ping table results.csv --title "Errors"
   tg-ping math 'u_t + u u_x = 0 \\ u(x,0) = u_0(x)'
-  tg-ping run --label "sweep" --every 30m --stall 20m --attach-log -- make test
+  tg-ping run --label "sweep" --every 30m --stall 20m --alert 'NaN|diverg' -- make test
   tg-ping wait 41532 --label "sweep" --log sweep.log
   tg-ping progress start "Training" --expected 2h
   tg-ping progress update "epoch 5 of 20" --percent 5/20
   tg-ping progress done "converged"
   answer=$(tg-ping ask "Which basis?" -o Chebyshev -o Fourier --wait 900)
+  answer=$(tg-ping ask "Which figure?" --photo a.png --photo b.png -o left -o right)
+  file=$(tg-ping receive "Please send the PDF" --wait 15m --out inbox/)
   tg-ping edit --last "corrected text";  tg-ping delete --last
 
 Levels: --start --info --ok --warn --fail --partial --blocked --debug --level question
-Delivery: --silent --pin --topic ID --chat ID --cooldown 300 --no-stdin
+Delivery: --silent --pin --topic ID --chat ID --reply-to last --cooldown 300 --no-stdin
 Formats: auto (default), --rich (formulas typeset by Telegram), --plain, --html
 Safety: --dry-run --disabled --soft-fail
 Settings: tg-ping config set machine NAME | topics project | quiet-hours 23-08
@@ -5912,6 +6426,7 @@ COMMANDS
   progress    keep a single message updated in place
   ask         ask a question and wait for the answer on the phone
   poll        send a native Telegram poll
+  receive     wait for a file sent from the phone (a photo, a document) and save it
   wait        send a message when a running process ends
   edit        correct a message already sent
   delete      withdraw a message already sent
@@ -5937,6 +6452,9 @@ MESSAGE PARTS, combine them freely
       --field KEY=VALUE a bold key followed by its value, repeatable
       --math LATEX      a formula with the message, repeatable: typeset by Telegram
                         in the rich format, drawn as a picture otherwise
+      --photo FILE      a picture with the message, repeatable (a PDF, SVG or EPS
+                        figure is drawn first); --document FILE a file: they carry
+                        the text as their caption when it fits, or follow it as a reply
       --code TEXT       a code block; --code-file FILE reads it, --lang NAME highlights it
       --quote TEXT      a block quote; --quote-file FILE reads it, --collapse folds it
       --percent N       a progress bar: 45, 45.5, or a count such as 37/512
@@ -5947,7 +6465,7 @@ MESSAGE PARTS, combine them freely
 DELIVERY
   -c, --chat ID         target chat, repeatable, overrides the settings
       --topic ID        forum topic (message thread) inside a group
-      --reply-to ID     reply to an existing message
+      --reply-to ID     reply to an existing message; 'last' is the last one this project sent
       --silent          deliver without a notification sound
       --pin             pin the message after sending
       --protect         forbid forwarding and saving
@@ -6030,15 +6548,17 @@ EXAMPLES
   $TG_PING_NAME --ok --title "Tests green" "142 passed in 38 s" --meta
   $TG_PING_NAME --fail --title "Build broke" --code-file build.log --lang text
   $TG_PING_NAME --ok --title "Lemma closed" "The energy decays." --math 'E(t) \\leqslant E(0)'
+  $TG_PING_NAME --ok --title "Figure ready" "The spectrum is real." --photo figures/spectrum.pdf
   $TG_PING_NAME photo figures/convergence.pdf --caption "Second order confirmed"
   $TG_PING_NAME pdf paper.pdf --pages 1,7-8 --caption "The new section" --attach
   $TG_PING_NAME rich report.md --title "Opening of the sweep"
   $TG_PING_NAME table results.csv --title "Errors per resolution"
-  $TG_PING_NAME run --label "sweep" --every 30m --stall 20m --attach-log -- julia sweep.jl
+  $TG_PING_NAME run --label "sweep" --every 30m --stall 20m --alert 'NaN|diverg' -- julia sweep.jl
   $TG_PING_NAME progress start "Training" --expected 2h
   $TG_PING_NAME progress update "epoch 5 of 20" --percent 5/20
   $TG_PING_NAME progress done "converged, loss 3.1e-4"
-  answer=\$($TG_PING_NAME ask "Which basis?" -o Chebyshev -o Fourier --wait 900)
+  answer=\$($TG_PING_NAME ask "Which figure?" --photo a.png --photo b.png -o left -o right --wait 900)
+  file=\$($TG_PING_NAME receive "Please send the referee's PDF" --wait 15m --out inbox/)
 
 NOTES FOR AGENTS
   Send a message when a long job starts, when it ends or fails, when a figure
@@ -6047,7 +6567,8 @@ NOTES FOR AGENTS
   over a stream of small updates, and use --cooldown when a loop might repeat.
   Use 'ask' when you need a human decision: it prints the answer on stdout,
   and questions from several sessions or computers never mix their answers.
-  Never pass a token on the command line and never echo it.
+  Use 'receive' when you need a file from the user: it saves what they send
+  and prints the path. Never pass a token on the command line and never echo it.
 
 Homepage: https://github.com/dutykh/tg-ping
 EOS
@@ -6060,11 +6581,15 @@ $TG_PING_NAME send: deliver a text message.
   <command> | $TG_PING_NAME [send] [options]
 
 The body may come from the arguments, from --message, or from stdin. Every
-message part described in '$TG_PING_NAME --help' applies here.
+message part described in '$TG_PING_NAME --help' applies here. The pictures
+of --photo (a PDF, SVG or EPS figure drawn first) and the files of --document
+carry the text as their caption when it fits, and otherwise follow it as a
+reply; a rich message embeds them.
 
   $TG_PING_NAME --ok --title "Deployment finished" "Version 2.3 is live" --meta
   $TG_PING_NAME --item "data loaded" --item "model fitted" --item "report written"
   $TG_PING_NAME --field "runs=512" --field "best error=1.4e-8" --title "Sweep"
+  $TG_PING_NAME --ok --title "Figure ready" "The spectrum is real." --photo figures/spectrum.pdf
   tail -n 40 run.log | $TG_PING_NAME --title "Last lines" --code -
 EOS
 }
@@ -6170,22 +6695,27 @@ help_run() { cat <<EOS
 $TG_PING_NAME run: run a command and report how it ended.
 
   $TG_PING_NAME run [--label TEXT] [--notify-start] [--tail N] [--on WHEN]
-                    [--every DURATION] [--stall DURATION] [--limit DURATION]
-                    [--attach-log | --attach-log-always] [--log FILE]
-                    [--quiet-output] [--exit-zero] -- COMMAND...
+                    [--every DURATION] [--stall DURATION] [--alert PATTERN]
+                    [--limit DURATION] [--attach-log | --attach-log-always]
+                    [--log FILE] [--photo FILE] [--quiet-output] [--exit-zero] -- COMMAND...
 
 The command runs whatever happens to the notifications, its output still
 reaches the terminal, Ctrl-C still reaches it, and its exit code is passed
 through. --every keeps one status message, edited silently with the time
 elapsed and the last lines of output; the report arrives as a new message.
---stall warns once when the output has been silent that long. --limit stops
-the command at a deadline. --attach-log sends the complete log on failure
-(--attach-log-always every time), --log keeps it in FILE. --on takes always
+--stall warns once when the output has been silent that long. --alert warns
+at the first line of the output matching PATTERN (an extended regular
+expression, repeatable: each pattern warns once), with that line and the
+lines before it. --limit stops the command at a deadline. --attach-log sends
+the complete log on failure (--attach-log-always every time), --log keeps
+it in FILE. --photo FILE sends a figure with the report, one the command
+itself may have produced (missing, it is left out). --on takes always
 (default), success, failure or never. On failure the last --tail lines
 (default 20) travel with the report. Durations read 90s, 15m, 2h or 1h30m.
 
   $TG_PING_NAME run --label "test suite" -- make test
   $TG_PING_NAME run --label "sweep" --every 30m --stall 20m --attach-log -- julia sweep.jl
+  $TG_PING_NAME run --label "solver" --alert 'NaN|diverg' --photo figures/residual.png -- ./solve
   $TG_PING_NAME run --on failure --exit-zero -- ./flaky-check.sh
 EOS
 }
@@ -6203,6 +6733,9 @@ edit the same one. Each update shows the time elapsed and, with a percentage,
 the expected end, counting down on the phone. 'done' gives the duration
 against --expected, and since an edit never rings the phone, it also sends a
 short reply, unless --edit-only. An update refused for its rate is skipped.
+A picture (--photo) or a formula (--math) given with start or update follows
+the message as a reply, since an edited text cannot carry one; with done it
+goes with the final reply.
 
   $TG_PING_NAME progress start "Training the network" --expected 2h
   for epoch in \$(seq 1 20); do
@@ -6217,12 +6750,15 @@ $TG_PING_NAME ask: put a question on the phone and wait for the answer.
 
   $TG_PING_NAME ask "question" -o OPTION [-o OPTION...] [--wait SECONDS]
                     [--default TEXT] [--strict] [--cols N] [--json]
+                    [--photo FILE]... [--math LATEX]...
 
 The options appear as buttons (a yes in green, a no in red). The answer is
 printed on stdout, alone, so it can be captured. A typed reply is accepted as
 well, unless --strict is given: a reply to the question, or the message that
 follows it directly. Without an answer before the deadline the exit code is
-7, or the --default value is printed and the exit code is 0.
+7, or the --default value is printed and the exit code is 0. The pictures of
+--photo and the formulas of --math go first, as an album the question
+answers, so that the buttons sit right under the question.
 
 Questions from several sessions, and from several computers sharing the bot,
 may wait at the same time: each answer reaches its own question.
@@ -6231,6 +6767,7 @@ may wait at the same time: each answer reaches its own question.
   case "\$answer" in Chebyshev) ... ;; Fourier) ... ;; esac
 
   $TG_PING_NAME ask "Continue after the failing test?" -o yes -o no --default no
+  $TG_PING_NAME ask "Which figure goes in the paper?" --photo a.pdf --photo b.pdf -o left -o right
 EOS
 }
 
@@ -6244,6 +6781,29 @@ $TG_PING_NAME poll: send a native Telegram poll.
 until somebody answers and prints the chosen options.
 
   $TG_PING_NAME poll "Which figure goes in the paper?" -o "spectrum" -o "residual" -o "both"
+EOS
+}
+
+help_receive() { cat <<EOS
+$TG_PING_NAME receive: wait for a file sent from the phone and save it.
+
+  $TG_PING_NAME receive ["prompt"] [--wait SECONDS] [--out FOLDER|FILE] [--kind KIND] [--json]
+
+A photo, a document, a video or a voice note sent to the bot is saved here
+and its path is printed on stdout, alone, so that a script or an agent can
+open it. With a prompt, the question goes out first (a reply field opens on
+the phone) and the file that answers it, or that follows it, is taken.
+Without one, the next file of the chat is taken, or one sent in the last ten
+minutes that no other question claimed. --out names the folder (the working
+folder by default) or the file; a document keeps its own name, a photo is
+called after the time, and nothing is overwritten. --kind photo, document,
+video, audio or voice takes files of that kind only. Without a file before
+the deadline the exit code is 7. Telegram hands over files of up to 20 MB.
+With --json, the path comes with the kind, the name, the caption and the
+size.
+
+  file=\$($TG_PING_NAME receive "Please send a photo of the whiteboard" --wait 15m --out inbox/)
+  $TG_PING_NAME receive --kind document --out referee-report.pdf
 EOS
 }
 
@@ -6382,6 +6942,7 @@ help_command() {
         progress)         help_progress ;;
         ask)              help_ask ;;
         poll)             help_poll ;;
+        receive|get)      help_receive ;;
         rich)             help_rich ;;
         pdf)              help_pdf ;;
         edit)             help_edit ;;
@@ -6410,9 +6971,10 @@ hoist_command() {
     # A command word written after options moves to the front, so that
     # 'tg-ping --caption "Spectrum" photo fig.png' sends the photo instead of
     # the words "photo fig.png". Only commands that take arguments move, only
-    # when an argument follows them, and '--' ends the search, so that
-    # 'tg-ping --ok -- math' still sends the word.
-    local i=1 n=$# j arg
+    # when an argument follows them (a word that is not an option, or '--'
+    # with words after it), and a '--' before the word ends the search, so
+    # that 'tg-ping --ok -- math' still sends the word.
+    local i=1 n=$# j k arg found
     HOISTED=("$@")
     while [ "$i" -le "$n" ]; do
         arg=${!i}
@@ -6427,7 +6989,15 @@ hoist_command() {
         esac
         [ "$i" -gt 1 ] || return 0
         case "$HOISTABLE" in *" $arg "*) ;; *) return 0 ;; esac
-        [ "$i" -lt "$n" ] || return 0
+        k=$(( i + 1 )); found=0
+        while [ "$k" -le "$n" ]; do
+            case "${!k}" in
+                --)   [ "$k" -lt "$n" ] && found=1; break ;;
+                -?*)  case "$VALUE_OPTS" in *" ${!k} "*) k=$(( k + 2 )) ;; *) k=$(( k + 1 )) ;; esac ;;
+                *)    found=1; break ;;
+            esac
+        done
+        [ "$found" -eq 1 ] || return 0
         HOISTED=("$arg")
         j=1
         while [ "$j" -le "$n" ]; do
@@ -6468,12 +7038,13 @@ main() {
         wait)               shift; cmd_wait "$@" ;;
         ask)                shift; parse_common_args "$@"
                             [ "$HELP_REQUESTED" -eq 1 ] && { help_ask; exit "$EX_OK"; }
-                            [ -n "$BODY" ] || BODY=$(join_remaining)
+                            body_from_remaining
                             cmd_ask ;;
         poll)               shift; parse_common_args "$@"
                             [ "$HELP_REQUESTED" -eq 1 ] && { help_poll; exit "$EX_OK"; }
-                            [ -n "$BODY" ] || BODY=$(join_remaining)
+                            body_from_remaining
                             cmd_poll ;;
+        receive|get)        shift; cmd_receive "$@" ;;
         init|setup)         shift; cmd_init "$@" ;;
         doctor|check)       shift; cmd_doctor "$@" ;;
         chats|whoami)       shift; cmd_chats "$@" ;;

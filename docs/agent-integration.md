@@ -80,7 +80,13 @@ tg-ping pdf paper.pdf --pages 7-8 --caption "The corrected section" --attach
 tg-ping math 'u_t + 6 u u_x + u_{xxx} = 0 \\ u(x, 0) = u_0(x)' --caption "The problem"
 tg-ping table results.csv --title "Errors per resolution"
 tg-ping --ok --title "Lemma closed" "The energy decays." --math 'E(t) \leqslant E(0)'
+tg-ping --ok --title "Figure ready" "The spectrum is real." --photo figures/spectrum.pdf
 ```
+
+The last form is the one an agent reaches for most: the message it composes
+anyway, with the figure or the document attached (`--photo`, `--document`,
+repeatable). The text becomes the caption when it fits, and otherwise goes
+first with the files as its reply, so nothing has to be sent twice.
 
 A longer report written in Markdown, with its figures, goes as one rich
 message, where Telegram typesets the formulas itself:
@@ -98,7 +104,13 @@ if the output falls silent:
 
 ```bash
 tg-ping run --label "sweep" --every 30m --stall 20m --attach-log -- julia sweep.jl
+tg-ping run --label "solver" --alert 'NaN|diverg' --photo figures/residual.png -- ./solve
 ```
+
+The option `--alert` watches the output for a pattern and warns at the first
+line matching it, so a solver that begins producing `NaN` is reported in the
+minute it happens; `--photo` sends with the report a figure the command
+itself produced.
 
 A computation started earlier without `tg-ping` can still be followed:
 
@@ -125,7 +137,27 @@ Several agents may ask at the same time, from several terminals or from
 several computers sharing the bot: each answer reaches its own question. A
 button press carries the identity of its question; a typed answer counts when
 it replies to the question or directly follows it, and it is acknowledged with
-a 👍.
+a 👍. A question about figures shows them: with `--photo`, the pictures go
+first as an album and the question answers them, buttons underneath.
+
+```bash
+choice=$(tg-ping ask "Which figure goes in the paper?" \
+                 --photo figures/a.pdf --photo figures/b.pdf -o left -o right --wait 900)
+```
+
+The phone can also send something back. The command `receive` waits for a
+file (a photo of a whiteboard, the PDF of a referee report, a voice note),
+saves it and prints its path, so an agent can ask for a document and open
+it:
+
+```bash
+file=$(tg-ping receive "Please send the referee's PDF" --wait 15m --out inbox/)
+```
+
+With a prompt, the file that answers it or follows it is taken; without one,
+the next file of the chat, or one sent in the last ten minutes that nobody
+claimed. The exit code is `7` when nothing arrives before the deadline, and
+Telegram hands over files of up to 20 MB.
 
 ## Keeping the phone calm
 

@@ -20,10 +20,12 @@ to you.
 
 ```bash
 tg-ping --ok --title "Sweep finished" "512 runs, best error 1.4e-8" --meta
+tg-ping --ok --title "Figure ready" "The spectrum is real." --photo figures/spectrum.pdf
 tg-ping photo figures/convergence.pdf --caption "Second order confirmed"
 tg-ping math '\lambda_1 = \pi^2/4' --caption "First eigenvalue of the operator"
-tg-ping run --label "sweep" --every 30m --stall 20m -- julia sweep.jl
+tg-ping run --label "sweep" --every 30m --stall 20m --alert 'NaN|diverg' -- julia sweep.jl
 answer=$(tg-ping ask "Which basis?" -o Chebyshev -o Fourier --wait 900)
+file=$(tg-ping receive "Please send the referee's PDF" --wait 15m --out inbox/)
 ```
 
 ## Contents
@@ -42,6 +44,7 @@ answer=$(tg-ping ask "Which basis?" -o Chebyshev -o Fourier --wait 900)
 * [Figures, pages and videos](#figures-pages-and-videos)
 * [Long jobs](#long-jobs)
 * [Asking the human a question](#asking-the-human-a-question)
+* [Receiving a file from the phone](#receiving-a-file-from-the-phone)
 * [Correcting a message](#correcting-a-message)
 * [Using it from a coding agent](#using-it-from-a-coding-agent)
 * [Exit codes](#exit-codes)
@@ -59,21 +62,23 @@ answer=$(tg-ping ask "Which basis?" -o Chebyshev -o Fourier --wait 900)
 | `tg-ping code file.py` | a highlighted block, or a document when too long |
 | `tg-ping table results.csv` | aligned columns, numbers on the right |
 | `tg-ping math '\int_0^1 x^2\,dx'` | a typeset formula, as a picture |
+| `tg-ping --title "Done" "text" --photo fig.pdf` | a message with its figure, the text as the caption, or the pictures as a reply |
 | `tg-ping photo fig.pdf` | a picture (PDF, SVG and EPS figures are drawn first), or albums |
 | `tg-ping pdf paper.pdf --pages 3,7-9` | pages of a PDF as pictures |
 | `tg-ping file report.pdf` | any document up to 50 MiB; a larger video is re-encoded to fit |
 | `tg-ping rich report.md` | a Markdown report as one rich message, figures included |
-| `tg-ping run -- make test` | a report card once the command finishes |
+| `tg-ping run --alert NaN -- make test` | a report card once the command finishes, and a warning at the first `NaN` |
 | `tg-ping progress update ...` | one message, edited in place as work advances |
 | `tg-ping wait 41532` | a message when a process started earlier ends |
 | `tg-ping ask "Ship it?" -o yes -o no` | buttons, and the answer comes back on stdout |
+| `tg-ping receive "Send me the PDF"` | a file sent from the phone, saved here, its path printed |
 | `tg-ping poll "Which figure?" -o a -o b` | a native Telegram poll |
 | `tg-ping edit --last "corrected text"` | the last message, corrected in place |
 
 Everything is composable: titles, bullet lists, key and value fields, code
-blocks, collapsible quotes, progress bars, formulas, link buttons, silent
-delivery, pinning, forum topics, the name of the machine, and a footer
-carrying host, repository and time.
+blocks, collapsible quotes, progress bars, formulas, pictures and documents,
+link buttons, silent delivery, pinning, forum topics, the name of the
+machine, and a footer carrying host, repository and time.
 
 ## Installation on Ubuntu
 
@@ -208,8 +213,10 @@ wins:
 Configuration files are parsed as `KEY=VALUE`. They are never sourced and never
 evaluated, so a hostile file cannot execute anything: a value such as
 `$(rm -rf /)` stays a harmless string and is rejected as a malformed chat id. A
-value may be quoted, a comment starts at a blank followed by `#`, and a path
-written in one of them may begin with `~/`, which is expanded.
+value may be quoted (inside double quotes a backslash escapes a quote or a
+backslash, which is how `config set` writes a value holding both kinds of
+quotes), a comment starts at a blank followed by `#`, and a path written in
+one of them may begin with `~/`, which is expanded.
 
 ### Where the credentials belong
 
@@ -435,7 +442,8 @@ Every part is optional and they combine in a fixed order:
  emoji  machine · bold title         --level, --emoji, the machine name, --title
  body text                           positional text, -m, or stdin
  formula                             --math, repeatable
- ▰▰▰▰▱▱▱▱ 45%                        --percent
+ picture, document                   --photo FILE, --document FILE, repeatable
+ ▰▰▰▱▱▱▱▱ 45%                        --percent
  • bullet                            --item, repeatable
  key: value                          --field "key=value", repeatable
  collapsible quotation               --quote, --collapse
@@ -634,6 +642,21 @@ call sends it, and the next calls with the same key replace it.
 tg-ping photo residual.png --key residual --replace --caption "after 400 iterations"
 ```
 
+Any message can carry pictures and documents, with `--photo FILE` and
+`--document FILE`, both repeatable: a short text becomes the caption of the
+picture (or of the album), a longer one is sent first and the files follow
+as its reply, and so do they when the message has buttons, which an album
+cannot hold. A vector figure given to `--photo` is drawn first, `--each` gives
+each file its own line, and a rich message embeds the files in the message
+itself. The report of `run` and the message of `wait` take them too, so the
+figure a computation produces can travel with its own report:
+
+```bash
+tg-ping --ok --title "Figure ready" "The spectrum is real." --photo figures/spectrum.pdf
+tg-ping --title "Results" "512 runs" --photo errors.png --document results.csv
+tg-ping run --label "solver" --photo figures/residual.png -- ./solve
+```
+
 The command `pdf` sends chosen pages of a document as pictures, drawn at 200
 dpi, with the caption saying which pages of how many; `--attach` adds the PDF
 itself:
@@ -659,6 +682,7 @@ reported as such.
 ```bash
 tg-ping run --label "test suite" -- make test
 tg-ping run --label "sweep" --every 30m --stall 20m --attach-log -- julia sweep.jl
+tg-ping run --label "solver" --alert 'NaN|diverg' --photo figures/residual.png -- ./solve
 tg-ping run --notify-start --tail 50 --limit 2h -- python train.py
 tg-ping run --on failure -- ./nightly.sh          # only complain when it breaks
 ```
@@ -668,12 +692,18 @@ the output. The option `--every 30m` keeps one status message, edited silently
 with the time elapsed and the last lines of output, while the final report
 arrives as a new message, since an edit never rings the phone. The option
 `--stall 20m` warns once when the output has been silent that long, and
+`--alert PATTERN` warns at the first line of the output matching the pattern
+(an extended regular expression, repeatable, each pattern warning once), with
+that line and the lines before it, so a solver that starts producing `NaN`
+is caught at once rather than at the end of the night. The option
 `--attach-log` sends the complete log on failure (`--attach-log-always` every
-time, compressed when large); `--log FILE` keeps it. The options `--tail N`,
-`--on always|success|failure|never`, `--limit` and `--exit-zero` complete them;
-durations read `90s`, `15m`, `2h` or `1h30m`. The common options work here too,
-so `--chat`, `--silent`, `--topic` and the rest may appear before the `--` that
-introduces the command.
+time, compressed when large); `--log FILE` keeps it, and `--photo FILE` sends
+a figure with the report, one the command itself may have drawn (missing, it
+is left out). The options `--tail N`, `--on always|success|failure|never`,
+`--limit` and `--exit-zero` complete them; durations read `90s`, `15m`, `2h`
+or `1h30m`. The common options work here too, so `--chat`, `--silent`,
+`--topic` and the rest may appear before the `--` that introduces the
+command.
 
 For work that reports its own progress, `progress` keeps a single message up to
 date instead of filling the chat:
@@ -738,6 +768,16 @@ printed and the exit code is `0`, which lets an agent proceed on a sensible
 assumption when you are asleep. With `--json`, the answer comes as one JSON
 document.
 
+A question about figures carries them: with `--photo`, the pictures go first
+as an album and the question answers them, so that the buttons sit right
+under the question on the phone; formulas given with `--math` travel the same
+way.
+
+```bash
+choice=$(tg-ping ask "Which figure goes in the paper?" \
+                 --photo figures/a.pdf --photo figures/b.pdf -o left -o right --wait 900)
+```
+
 Several questions may wait at the same time, from several terminals and from
 several computers sharing the bot, and each answer reaches its own question.
 Telegram lets one reader at a time fetch a bot's messages, so the processes of
@@ -749,6 +789,32 @@ questions, and `tg-ping doctor` says so.
 The command `poll` sends a native Telegram poll instead, which suits a group,
 and `--wait SECONDS` blocks until somebody votes.
 
+## Receiving a file from the phone
+
+The conversation goes both ways. The command `receive` waits for a file sent
+to the bot from the phone, a photo of a whiteboard, the PDF of a paper, a
+voice note, saves it here and prints its path on stdout, alone, so that an
+agent can ask for a document and open it:
+
+```bash
+file=$(tg-ping receive "Please send a photo of the whiteboard" --wait 15m --out inbox/)
+tg-ping receive --kind document --out referee-report.pdf
+```
+
+With a prompt, the question goes out first (the reply field opens on the
+phone) and the file that answers it, or that follows it, is taken; without
+one, the next file of the chat is taken, or one sent in the last ten minutes
+that no other question claimed, so a file sent a moment before the agent
+started waiting is not lost. The option `--out` names the folder (the working
+folder by default) or the file itself; a document keeps its own name, a photo
+is named after its kind and the time, and nothing is ever overwritten. The
+option `--kind photo|document|video|audio|voice` takes files of that kind
+only, and a file of another kind is left for a question that wants it. The
+received file is acknowledged with a 👍, the prompt records what arrived, and
+with `--json` the path comes with the kind, the name, the caption and the
+size. Without a file before the deadline the exit code is `7`. Telegram hands
+over files of up to 20 MB this way; a larger one is best sent as a link.
+
 ## Correcting a message
 
 A message already sent can be corrected or withdrawn, by its number (printed by
@@ -759,7 +825,9 @@ tg-ping edit --last "Sweep finished, best error 1.4e-9"
 tg-ping delete --last
 ```
 
-Telegram lets a bot delete its messages for 48 hours.
+Telegram lets a bot delete its messages for 48 hours. The same memory serves
+`--reply-to last`, which makes a message answer the last one this project
+sent, so that a follow up stays with what it follows.
 
 ## Using it from a coding agent
 
@@ -780,7 +848,8 @@ tg-ping hook hooks                    # Claude Code hooks for .claude/settings.j
 The generated section tells the agent to ping when a long task starts, when a
 build or test run finishes or fails, when a figure or document is ready, when
 it is blocked on a decision, and when the objective is complete, keeping each
-message to one or two sentences. The guide
+message to one or two sentences; it also says that a question may carry its
+figures and that `receive` fetches a file from the user. The guide
 [Letting an agent report to you](docs/agent-integration.md) goes further.
 
 Two options exist for the agent's own safety: `--cooldown SECONDS` drops
@@ -852,6 +921,7 @@ or `--math` to render a test formula.
 | The machine name is missing | Name the machine: `tg-ping config set machine NAME`. |
 | A script hangs or loses its input | The body is read from a pipe when no text is given. Add `--no-stdin`, or set `TG_PING_NO_STDIN=1`. |
 | Formulas render without my macros | The preamble extension must match the engine, `.tex` for LaTeX and `.typ` for typst, and the path must be readable. Both cases warn on stderr. |
+| `receive` gets nothing | The file must go to the chat the bot uses, as a photo or a document, and Telegram hands over files of up to 20 MB only. A webhook set on the bot stops `receive` as it stops `ask`. |
 | `tg-ping: command not found` | `~/.local/bin` is not on your `PATH`. See [Installation on Ubuntu](#installation-on-ubuntu). |
 
 ## Development
@@ -868,13 +938,14 @@ TG_PING_HIDE="jq python3" tests/run-tests.sh
 shellcheck -x bin/tg-ping install.sh tests/run-tests.sh tests/stub/curl
 ```
 
-The 142 cases cover the settings and their scopes, the safety of the parser
+The 165 cases cover the settings and their scopes, the safety of the parser
 against a hostile file, the command word found after options, escaping and
 emphasis, the splitting of long messages and captions in every awk, the
 fallbacks of markup, captions, rich messages and topics, media of every kind,
-retries and exit codes, two questions waiting at once on one machine and on
-two, the supervision of `run`, the progress slots, the machine name, the
-completions and the help pages. The stub can replay a queue of answers for
+the pictures and documents of a message, retries and exit codes, two
+questions waiting at once on one machine and on two, the files received from
+the phone, the supervision and the alerts of `run`, the progress slots, the
+machine name, the completions and the help pages. The stub can replay a queue of answers for
 each method, a conflict between two readers, slow replies and the refusals
 Telegram really sends. Please add a case with any change in behaviour.
 
