@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-TG_PING_VERSION="2.1.0"
+TG_PING_VERSION="2.2.0"
 TG_PING_NAME="tg-ping"
 
 TAB=$(printf '\t')
@@ -277,6 +277,169 @@ machine_tag() {
     [ -n "$icon" ] || icon=$(machine_icon_for "$(detect_machine_kind)")
     case "$(lc "$icon")" in none|off) icon="" ;; esac
     printf '%s%s' "${icon:+$icon }" "$name"
+}
+
+# ---------------------------------------------------------------------------
+# Which agent is speaking
+# ---------------------------------------------------------------------------
+
+agent_chain() {
+    # The programs above this process, nearest first, one per line as
+    # "name<TAB>argument 0<TAB>argument 1<TAB>argument 2<TAB>argument 3",
+    # read from /proc where it exists, which starts no program, else from
+    # ps. TG_PING_PROC_DIR stands for /proc, so that a test can empty it.
+    local proc="${TG_PING_PROC_DIR:-/proc}" pid="$PPID" n=0 line comm a0 a1 a2 a3
+    if [ -n "${TG_PING_PROC_DIR:-}" ] || [ -r "$proc/$$/stat" ]; then
+        while [ "$n" -lt 64 ] && is_number "$pid" && [ "$pid" -gt 1 ]; do
+            line=""
+            IFS= read -r line 2>/dev/null < "$proc/$pid/stat" || [ -n "$line" ] || break
+            comm=""; a0=""; a1=""; a2=""; a3=""
+            IFS= read -r comm 2>/dev/null < "$proc/$pid/comm" || true
+            { IFS= read -r -d '' a0; IFS= read -r -d '' a1
+              IFS= read -r -d '' a2; IFS= read -r -d '' a3; } 2>/dev/null < "$proc/$pid/cmdline" || true
+            printf '%s\t%s\t%s\t%s\t%s\n' "$comm" "$a0" "$a1" "$a2" "$a3"
+            # The parent is the second field after the name in parentheses,
+            # a name that may itself hold spaces and parentheses.
+            line=${line##*) }; line=${line#* }; pid=${line%% *}
+            n=$(( n + 1 ))
+        done
+    elif have ps; then
+        ps -A -o pid= -o ppid= -o args= 2>/dev/null | awk_run -v start="$PPID" '
+            { up[$1] = $2; seen[$1] = $3 "\t" $3 "\t" $4 "\t" $5 "\t" $6 }
+            END {
+                p = start; n = 0
+                while (p > 1 && (p in up) && n < 64) { print seen[p]; p = up[p]; n++ }
+            }'
+    fi
+    return 0
+}
+
+agent_match() {
+    # The lines of agent_chain on stdin -> the agent that the nearest program
+    # standing for one names: by its own name, or, for an interpreter (node,
+    # python, a shell), by the script it runs, its first argument that is not
+    # an option. All the input is read, so that the writer never meets a
+    # closed pipe.
+    awk_run '
+        function base(s) {
+            sub(/.*\//, "", s); s = tolower(s)
+            sub(/^\./, "", s); sub(/\.(exe|js|mjs|cjs)$/, "", s)
+            return s
+        }
+        function agent(n) {
+            if (n == "claude" || n == "claude-code")  return "Claude"
+            if (n == "codex" || n ~ /^codex-/)        return "Codex"
+            if (n == "grok" || n ~ /^grok-/)          return "Grok"
+            if (n == "opencode")                      return "OpenCode"
+            if (n == "gemini")                        return "Gemini"
+            if (n == "agy" || n == "antigravity")     return "Antigravity"
+            if (n == "cursor-agent")                  return "Cursor"
+            if (n == "copilot")                       return "Copilot"
+            if (n == "aider")                         return "Aider"
+            if (n == "amp")                           return "Amp"
+            if (n == "goose")                         return "Goose"
+            if (n == "qwen")                          return "Qwen Code"
+            if (n == "crush")                         return "Crush"
+            if (n == "droid")                         return "Droid"
+            if (n == "auggie")                        return "Augment"
+            if (n == "kiro-cli")                      return "Kiro"
+            return ""
+        }
+        BEGIN { FS = "\t"; found = "" }
+        found == "" {
+            a = agent(base($1))
+            if (a == "") a = agent(base($2))
+            if (a == "" && base($2) ~ /^(node|nodejs|bun|deno|python[0-9.]*|pypy[0-9.]*|ruby|perl|bash|sh|dash|zsh|ksh|env)$/)
+                for (i = 3; i <= NF; i++)
+                    if (substr($i, 1, 1) != "-") { a = agent(base($i)); break }
+            found = a
+        }
+        END { if (found != "") print found }'
+}
+
+agent_from_env() {
+    # The agent named by the marks that agents leave in the environment of
+    # the commands they run, for a command whose agent cannot be seen above
+    # it: one run inside the sandbox of Codex, whose own process namespace
+    # hides every program outside it, or a job left running in the
+    # background. The marks of that sandbox come first, since they hold
+    # only inside it; then AI_AGENT, which several agents set for their
+    # commands, replacing the value of an agent that started them.
+    local v
+    if [ -n "${CODEX_SANDBOX:-}${CODEX_SANDBOX_NETWORK_DISABLED:-}" ]; then
+        printf 'Codex'; return 0
+    fi
+    v=$(lc "${AI_AGENT:-}")
+    case "$v" in
+        ""|1|0|true|false|yes|no|on|off) ;;
+        claude*)                   printf 'Claude'; return 0 ;;
+        codex*)                    printf 'Codex'; return 0 ;;
+        grok*)                     printf 'Grok'; return 0 ;;
+        opencode*)                 printf 'OpenCode'; return 0 ;;
+        gemini*)                   printf 'Gemini'; return 0 ;;
+        antigravity*|agy*|jetski*) printf 'Antigravity'; return 0 ;;
+        cursor*)                   printf 'Cursor'; return 0 ;;
+        copilot*|github-copilot*)  printf 'Copilot'; return 0 ;;
+        [a-z]*)
+            # Another agent, named by the first word of its mark.
+            v=${AI_AGENT%%[_ ]*}
+            printf '%s%s' "$(printf '%s' "${v:0:1}" | tr '[:lower:]' '[:upper:]')" "${v:1}"
+            return 0 ;;
+    esac
+    if   [ -n "${CLAUDECODE:-}" ]; then printf 'Claude'
+    elif [ -n "${CODEX_THREAD_ID:-}" ]; then printf 'Codex'
+    elif [ -n "${CODEX_MANAGED_BY_NPM:-}${CODEX_MANAGED_BY_PNPM:-}${CODEX_MANAGED_BY_BUN:-}" ]; then printf 'Codex'
+    elif [ -n "${GROK_SESSION_ID:-}${GROK_HOOK_EVENT:-}" ]; then printf 'Grok'
+    elif [ -n "${OPENCODE:-}${OPENCODE_SESSION_ID:-}" ]; then printf 'OpenCode'
+    elif [ -n "${ANTIGRAVITY_CONVERSATION_ID:-}" ]; then printf 'Antigravity'
+    elif [ -n "${GEMINI_CLI:-}" ]; then printf 'Gemini'
+    elif [ -n "${CURSOR_AGENT:-}" ]; then printf 'Cursor'
+    fi
+    return 0
+}
+
+detect_agent() {
+    # The agent this command works for: the nearest program above it that is
+    # one, else the marks of the environment, else nothing.
+    local a
+    a=$(agent_chain | agent_match)
+    [ -n "$a" ] || a=$(agent_from_env)
+    printf '%s' "$a"
+}
+
+resolve_agent() {
+    # AGENT_NAME, the agent named on the first line of every message, as
+    # TG_PING_AGENT or --agent decide: auto (the default) finds it, off
+    # leaves it out, and any other value is the name itself. It runs in the
+    # main shell, once, since messages are composed in subshells.
+    case "$(lc "$AGENT_MODE")" in
+        off|none|0|false|no|n)   AGENT_NAME="" ;;
+        ""|auto|on|1|true|yes|y) AGENT_NAME=$(detect_agent) ;;
+        *)                       AGENT_NAME="$AGENT_MODE" ;;
+    esac
+}
+
+agent_summary() {
+    # The agent line of 'config show'.
+    case "$(lc "$AGENT_MODE")" in
+        off|none|0|false|no|n)   printf 'not shown (TG_PING_AGENT=%s)' "$AGENT_MODE" ;;
+        ""|auto|on|1|true|yes|y)
+            if [ -n "$AGENT_NAME" ]; then printf '%s (detected)' "$AGENT_NAME"
+            else printf 'none detected here'; fi ;;
+        *)                       printf '%s (given by TG_PING_AGENT)' "$AGENT_NAME" ;;
+    esac
+}
+
+speaker_tag() {
+    # Who speaks, for the first line of a message: the machine and the agent
+    # working there ("🖥️ office desktop · Codex"), or whichever is known.
+    local machine
+    machine=$(machine_tag)
+    if [ -n "$machine" ] && [ -n "$AGENT_NAME" ]; then
+        printf '%s · %s' "$machine" "$AGENT_NAME"
+    else
+        printf '%s%s' "$machine" "$AGENT_NAME"
+    fi
 }
 
 settings_set() {
@@ -582,6 +745,7 @@ load_file_settings() {
     _from_file TG_PING_MATH_REMOTE TG_PING_MATH_REMOTE && MATH_REMOTE_OK=$(bool01 "$v")
     _from_file TG_PING_MACHINE     TG_PING_MACHINE     && MACHINE="$v"
     _from_file TG_PING_MACHINE_ICON TG_PING_MACHINE_ICON && MACHINE_ICON="$v"
+    _from_file TG_PING_AGENT       TG_PING_AGENT       && AGENT_MODE="$v"
     _from_file TG_PING_QUIET_HOURS TG_PING_QUIET_HOURS && QUIET_HOURS="$v"
     _from_file TG_PING_META        TG_PING_META        && META_FIELDS=$(lc "$v")
     _from_file TG_PING_TOPICS      TG_PING_TOPICS      && TOPICS_MODE=$(lc "$v")
@@ -1855,6 +2019,7 @@ BUTTON_COLS=1
 ITEMS=(); FIELDS=(); BUTTONS=()
 THREAD_ID="${THREAD_ID:-}"; PREFIX="${PREFIX:-}"
 MACHINE="${TG_PING_MACHINE:-}"; MACHINE_ICON="${TG_PING_MACHINE_ICON:-}"; SHOW_MACHINE=1
+AGENT_MODE="${TG_PING_AGENT:-}"; AGENT_NAME=""
 QUIET_HOURS="${TG_PING_QUIET_HOURS:-}"
 META_FIELDS=$(lc "${TG_PING_META:-host,repo,time}")
 TOPICS_MODE=$(lc "${TG_PING_TOPICS:-}")
@@ -1924,7 +2089,7 @@ build_message_rich() {
     local out="" head="" emoji tag f item entry key value i id
     emoji="$EMOJI"
     [ -n "$emoji" ] || emoji=$(level_emoji "$LEVEL")
-    tag=$(machine_tag)
+    tag=$(speaker_tag)
     [ -n "$emoji" ] && head="$emoji "
     [ -n "$tag" ] && head="$head$(printf '%s' "$tag" | html_escape) · "
     [ -n "$PREFIX" ] && head="$head$(printf '%s' "$PREFIX" | html_escape) "
@@ -1981,7 +2146,7 @@ build_message() {
     fi
     emoji="$EMOJI"
     [ -n "$emoji" ] || emoji=$(level_emoji "$LEVEL")
-    tag=$(machine_tag)
+    tag=$(speaker_tag)
 
     head=""
     [ -n "$emoji" ] && head="$emoji "
@@ -4509,14 +4674,15 @@ VALUE_OPTS=" -m --message --text -t --title -L --level --emoji --item --field --
  --reply-to --topic --thread --chat -c --token --token-file --profile -P --env-file --config --api
  --timeout --retries --cooldown --key --id --max-parts --caption --name --as --dpi --bg --background
  --out --preamble --sep --separator --wait --default --correct --each --math --file --pages
- --expected --photo --document --kind --label -l --tail --on --limit --every --stall --log --alert "
+ --expected --photo --document --kind --label -l --tail --on --limit --every --stall --log --alert
+ --agent "
 VALUE_OPTS=$(printf '%s' "$VALUE_OPTS" | tr '\n' ' ')
 
 # Every option without a value, those of 'run' included. The completions are
 # made from the two lists, and a test checks that they hold every option of
 # the parser.
 FLAG_OPTS=" --ok --success --info --warn --warning --fail --error --start --debug --partial
- --blocked --collapse --meta --no-meta --no-machine --plain --html --markdown --md --rich
+ --blocked --collapse --meta --no-meta --no-machine --no-agent --plain --html --markdown --md --rich
  --no-fallback --silent -s --pin --protect --preview --no-preview --dry-run -n --json --verbose -v
  --quiet -q --tee --soft-fail --disabled --insecure --truncate --no-stdin --typst --latex --inline
  --display --remote --prose --native --no-header --free-text --strict --multi --anonymous
@@ -4691,6 +4857,8 @@ parse_common_args() {
             --correct)            POLL_CORRECT="$2"; shift 2 ;;
             --rich)               FORMAT="rich"; shift ;;
             --no-machine)         SHOW_MACHINE=0; shift ;;
+            --agent)              AGENT_MODE="$2"; resolve_agent; shift 2 ;;
+            --no-agent)           AGENT_NAME=""; shift ;;
             --no-stdin)           NO_STDIN=1; shift ;;
             --each)               EACH[${#EACH[@]}]="$2"; shift 2 ;;
             --math)               MATH_LIST[${#MATH_LIST[@]}]="$2"; shift 2 ;;
@@ -5542,9 +5710,10 @@ cmd_rich() {
     [ "$n" -le 50 ] || die "$EX_USAGE" "a rich message holds at most 50 figures, the report has $n"
     [ -n "$media" ] && RICH_MEDIA_JSON="[$media]"
 
-    # The first line names the machine and the title, as every message does.
+    # The first line names the machine, the agent and the title, as every
+    # message does.
     emoji="$EMOJI"; [ -n "$emoji" ] || emoji=$(level_emoji "$LEVEL")
-    tag=$(machine_tag)
+    tag=$(speaker_tag)
     head="${emoji:+$emoji }${tag:+$tag · }${TITLE:+**$TITLE**}"
     head="${head% · }"; head="${head% }"
     [ -n "$head" ] && rewritten="$head
@@ -5903,6 +6072,8 @@ EOF
 
     if [ -n "$(machine_tag)" ]; then doctor_line ok "machine" "$(machine_tag)"
     else doctor_line note "machine" "not named; '$TG_PING_NAME config set machine NAME' shows it on every message"; fi
+    if [ -n "$AGENT_NAME" ]; then doctor_line ok "agent" "$(agent_summary)"
+    else doctor_line note "agent" "$(agent_summary); a message sent from here names no agent"; fi
 
     case ":$PATH:" in
         *":$HOME/.local/bin:"*) doctor_line ok "PATH" "\$HOME/.local/bin is on PATH" ;;
@@ -6028,6 +6199,7 @@ EOF
             printf 'chat id   : %s\n' "${CHATS:-not set}"
             printf 'chat from : %s\n' "${CHATS_SRC:-nowhere}"
             printf 'machine   : %s\n' "$( [ -n "$(machine_tag)" ] && machine_tag || printf 'not named')"
+            printf 'agent     : %s\n' "$(agent_summary)"
             printf 'project   : %s\n' "$( project_shown && printf '%s (on every message)' "$(project_label)" || printf 'not shown; %s config set project on' "$TG_PING_NAME")"
             printf 'topic     : %s\n' "${THREAD_ID:-none}"
             printf 'topics    : %s\n' "${TOPICS_MODE:-off}"
@@ -6051,6 +6223,7 @@ EOF
             [ -n "$key" ] || die "$EX_USAGE" "usage: $TG_PING_NAME config set KEY VALUE, or $TG_PING_NAME config unset KEY"
             case "$(lc "$key")" in
                 machine)              var=TG_PING_MACHINE ;;
+                agent)                var=TG_PING_AGENT ;;
                 icon|machine-icon)    var=TG_PING_MACHINE_ICON ;;
                 topics)               var=TG_PING_TOPICS ;;
                 quiet|quiet-hours)    var=TG_PING_QUIET_HOURS ;;
@@ -6061,7 +6234,7 @@ EOF
                 chat|chat-id)         var=TG_PING_CHAT_ID ;;
                 topic|thread)         var=TG_PING_THREAD_ID ;;
                 tg_ping_*)            var=$(printf '%s' "$key" | tr '[:lower:]' '[:upper:]') ;;
-                *) die "$EX_USAGE" "unknown setting '$key': use machine, icon, project, topics, quiet-hours, format, prefix, meta, chat, topic, or a TG_PING_* name" ;;
+                *) die "$EX_USAGE" "unknown setting '$key': use machine, icon, agent, project, topics, quiet-hours, format, prefix, meta, chat, topic, or a TG_PING_* name" ;;
             esac
             case "$var" in
                 TG_PING_TOKEN|TG_PING_BOT_TOKEN)
@@ -6157,7 +6330,9 @@ EOS
 Claude Code hooks. Put this in .claude/settings.json to be notified whenever
 the agent stops and whenever it needs attention. Claude Code hands each hook
 a JSON document on stdin, which --no-stdin leaves unread; --cooldown keeps a
-burst of stops to one message a minute.
+burst of stops to one message a minute. Grok runs these hooks too, so the
+titles name no agent: the first line of every message names the one that
+sends it.
 
 {
   "hooks": {
@@ -6166,7 +6341,7 @@ burst of stops to one message a minute.
         "hooks": [
           {
             "type": "command",
-            "command": "tg-ping --no-stdin --ok --title \"Claude finished\" --cooldown 60 --key claude-stop --meta \"Session ended in $(basename \"$PWD\")\""
+            "command": "tg-ping --no-stdin --ok --title \"Finished\" --cooldown 60 --key agent-stop --meta \"Session ended in $(basename \"$PWD\")\""
           }
         ]
       }
@@ -6176,7 +6351,7 @@ burst of stops to one message a minute.
         "hooks": [
           {
             "type": "command",
-            "command": "tg-ping --no-stdin --level question --title \"Claude needs you\" --meta \"Waiting in $(basename \"$PWD\")\""
+            "command": "tg-ping --no-stdin --level question --title \"Needs you\" --meta \"Waiting in $(basename \"$PWD\")\""
           }
         ]
       }
@@ -6324,7 +6499,7 @@ Levels: --start --info --ok --warn --fail --partial --blocked --debug --level qu
 Delivery: --silent --pin --topic ID --chat ID --reply-to last --cooldown 300 --no-stdin
 Formats: auto (default), --rich (formulas typeset by Telegram), --plain, --html
 Safety: --dry-run --disabled --soft-fail
-Settings: tg-ping config set machine NAME | project on | topics project | quiet-hours 23-08
+Settings: tg-ping config set machine NAME | agent auto | project on | topics project | quiet-hours 23-08
 Exit codes: 0 sent, 2 usage, 3 config, 4 network, 5 API, 6 rate limit, 7 timeout
 EOS
     exit "$EX_OK"
@@ -6522,6 +6697,9 @@ MESSAGE PARTS, combine them freely
                         with TG_PING_PROJECT=on every message ends with its project
       --no-meta         no footer on this message, not even the project
       --no-machine      leave out the name of this machine for once
+      --agent NAME      the agent named after the machine, found by itself otherwise
+                        (Claude, Codex, Grok, OpenCode, Gemini, Antigravity, ...);
+                        --no-agent leaves it out for once
 
 DELIVERY
   -c, --chat ID         target chat, repeatable, overrides the settings
@@ -6585,6 +6763,8 @@ SETTINGS, first match wins
 ENVIRONMENT
   TG_PING_TOKEN, TG_PING_CHAT_ID    credentials, chat id may be a comma separated list
   TG_PING_MACHINE                   the name of this machine, shown on every message
+  TG_PING_AGENT                     the agent shown next to it: auto (found by itself,
+                                    the default), off, or a name of your own
   TG_PING_PROJECT=on                every message ends with its project (repository and
                                     folder, or a name given here), when several agents report
   TG_PING_TOPICS=project            one topic per project and machine in the chat
@@ -6631,7 +6811,9 @@ NOTES FOR AGENTS
   Use 'ask' when you need a human decision: it prints the answer on stdout,
   and questions from several sessions or computers never mix their answers.
   Use 'receive' when you need a file from the user: it saves what they send
-  and prints the path. Never pass a token on the command line and never echo it.
+  and prints the path. Every message names its agent on its first line, found
+  by itself, so there is no need to sign one ('config show' says which agent
+  is seen). Never pass a token on the command line and never echo it.
 
 Homepage: https://github.com/dutykh/tg-ping
 EOS
@@ -7085,6 +7267,7 @@ main() {
             workdir_init
             preparse_config_flags "$@"
             load_file_settings
+            resolve_agent
             ;;
     esac
     case "$1" in

@@ -40,6 +40,16 @@ export TG_PING_NO_DOTENV=1
 export TG_PING_TOKEN="123456789:AAFakeTokenForTestsOnly_abcdefghijklmn"
 export TG_PING_CHAT_ID="-1001234567890"
 export TG_PING_DMI_DIR="$SANDBOX/dmi"
+# Nor may the agent running the suite appear in its messages: the marks
+# agents leave in the environment are cleared, and TG_PING_AGENT=off keeps
+# the programs above the suite out. The cases of the agent set their own.
+for var in AI_AGENT CLAUDECODE CODEX_SANDBOX CODEX_SANDBOX_NETWORK_DISABLED CODEX_THREAD_ID \
+           CODEX_MANAGED_BY_NPM CODEX_MANAGED_BY_PNPM CODEX_MANAGED_BY_BUN GROK_SESSION_ID \
+           GROK_HOOK_EVENT OPENCODE OPENCODE_SESSION_ID ANTIGRAVITY_CONVERSATION_ID GEMINI_CLI \
+           CURSOR_AGENT; do
+    unset "$var"
+done
+export TG_PING_AGENT=off
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$TG_PING_STATE_DIR" "$TG_PING_DMI_DIR"
 printf '10\n' > "$TG_PING_DMI_DIR/chassis_type"
 
@@ -2158,6 +2168,122 @@ if describe "project: config set project on, and the footer of --meta carries it
         bad "project: config set project on, and the footer of --meta carries it" "$(cat "$file" 2>/dev/null) / $text / $out"
     fi
     rm -f "$file"
+fi
+
+# --- the agent on every message (2.2) ------------------------------------------
+# Stand-ins for agents: scripts named like their programs, which run the
+# command they are given as a child, so that the tool finds them above it.
+mkdir -p "$SANDBOX/agents" "$SANDBOX/noproc"
+for name in codex claude grok gemini.js; do
+    printf '#!/bin/sh\n"$@"\nrc=$?\nexit $rc\n' > "$SANDBOX/agents/$name"
+    chmod +x "$SANDBOX/agents/$name"
+done
+
+if describe "agent: the program above names the agent after the machine"; then
+    start_case
+    env -u TG_PING_AGENT TG_PING_MACHINE=laptop "$SANDBOX/agents/codex" "$TG" --ok --title "Tests green" "x" >/dev/null 2>&1
+    named=$(field_value sendMessage text)
+    env -u TG_PING_AGENT "$SANDBOX/agents/grok" "$TG" --warn --title "Needs you" "y" >/dev/null 2>&1
+    alone=$(field_value sendMessage text)
+    if contains "$named" "✅ 💻 laptop · Codex · <b>Tests green</b>" && contains "$alone" "⚠️ Grok · <b>Needs you</b>"; then
+        ok "agent: the program above names the agent after the machine"
+    else
+        bad "agent: the program above names the agent after the machine" "$named / $alone"
+    fi
+fi
+
+if describe "agent: the nearest agent is the one named"; then
+    start_case
+    env -u TG_PING_AGENT "$SANDBOX/agents/claude" "$SANDBOX/agents/codex" "$TG" "inner codex" >/dev/null 2>&1
+    first=$(field_value sendMessage text)
+    env -u TG_PING_AGENT "$SANDBOX/agents/codex" "$SANDBOX/agents/claude" "$TG" "inner claude" >/dev/null 2>&1
+    second=$(field_value sendMessage text)
+    if [ "$first" = "Codex · inner codex" ] && [ "$second" = "Claude · inner claude" ]; then
+        ok "agent: the nearest agent is the one named"
+    else
+        bad "agent: the nearest agent is the one named" "$first / $second"
+    fi
+fi
+
+if describe "agent: a program run by an interpreter is known by its script"; then
+    start_case
+    env -u TG_PING_AGENT sh "$SANDBOX/agents/gemini.js" "$TG" "from node" >/dev/null 2>&1
+    check "agent: a program run by an interpreter is known by its script" "$(field_value sendMessage text)" \
+        "$( [ "$(field_value sendMessage text)" = "Gemini · from node" ] && echo 0 || echo 1 )"
+fi
+
+if describe "agent: the marks of the environment, when no program above is one"; then
+    start_case
+    wrong=""
+    for pair in "AI_AGENT=claude-code_2-1-0_agent:Claude" "AI_AGENT=opencode:OpenCode" "AI_AGENT=devin_1:Devin" \
+                "CLAUDECODE=1:Claude" "CODEX_THREAD_ID=t1:Codex" "GROK_SESSION_ID=s1:Grok" "OPENCODE=1:OpenCode" \
+                "ANTIGRAVITY_CONVERSATION_ID=c1:Antigravity" "GEMINI_CLI=1:Gemini"; do
+        env -u TG_PING_AGENT TG_PING_PROC_DIR="$SANDBOX/noproc" "${pair%:*}" "$TG" "m" >/dev/null 2>&1
+        [ "$(field_value sendMessage text)" = "${pair##*:} · m" ] || wrong="$wrong ${pair%:*}"
+    done
+    # Inside the sandbox of Codex, the AI_AGENT of an agent that started it
+    # does not win; a mark that names nobody, or no mark, names no agent.
+    env -u TG_PING_AGENT TG_PING_PROC_DIR="$SANDBOX/noproc" AI_AGENT=claude-code_2_agent \
+        CODEX_SANDBOX_NETWORK_DISABLED=1 "$TG" "m" >/dev/null 2>&1
+    [ "$(field_value sendMessage text)" = "Codex · m" ] || wrong="$wrong sandbox"
+    env -u TG_PING_AGENT TG_PING_PROC_DIR="$SANDBOX/noproc" AI_AGENT=true "$TG" "m" >/dev/null 2>&1
+    [ "$(field_value sendMessage text)" = "m" ] || wrong="$wrong AI_AGENT=true"
+    env -u TG_PING_AGENT TG_PING_PROC_DIR="$SANDBOX/noproc" "$TG" "m" >/dev/null 2>&1
+    [ "$(field_value sendMessage text)" = "m" ] || wrong="$wrong none"
+    check "agent: the marks of the environment, when no program above is one" "wrong:$wrong" \
+        "$( [ -z "$wrong" ] && echo 0 || echo 1 )"
+fi
+
+if describe "agent: TG_PING_AGENT gives a name or turns it off, --agent and --no-agent for one message"; then
+    start_case
+    TG_PING_AGENT="Codex (review)" "$TG" "named" >/dev/null 2>&1
+    named=$(field_value sendMessage text)
+    "$SANDBOX/agents/codex" "$TG" "off" >/dev/null 2>&1
+    off=$(field_value sendMessage text)
+    env -u TG_PING_AGENT "$SANDBOX/agents/codex" "$TG" --no-agent "hidden" >/dev/null 2>&1
+    hidden=$(field_value sendMessage text)
+    "$TG" --agent Gemini --ok --title "T" "flag" >/dev/null 2>&1
+    flag=$(field_value sendMessage text)
+    if [ "$named" = "Codex (review) · named" ] && [ "$off" = "off" ] && [ "$hidden" = "hidden" ] &&
+       contains "$flag" "✅ Gemini · <b>T</b>"; then
+        ok "agent: TG_PING_AGENT gives a name or turns it off, --agent and --no-agent for one message"
+    else
+        bad "agent: TG_PING_AGENT gives a name or turns it off, --agent and --no-agent for one message" \
+            "$named / $off / $hidden / $flag"
+    fi
+fi
+
+if describe "agent: config set agent, and config show and doctor say which agent is seen"; then
+    start_case
+    file="$XDG_CONFIG_HOME/tg-ping/default.env"
+    "$TG" config set agent off >/dev/null 2>&1
+    recorded=$(grep '^TG_PING_AGENT=' "$file" 2>/dev/null)
+    shown_off=$(env -u TG_PING_AGENT "$SANDBOX/agents/codex" "$TG" config show 2>&1 | grep '^agent')
+    rm -f "$file"
+    shown=$(env -u TG_PING_AGENT "$SANDBOX/agents/codex" "$TG" config show 2>&1 | grep '^agent')
+    doctor=$(env -u TG_PING_AGENT "$SANDBOX/agents/codex" "$TG" doctor 2>&1 | grep ' agent ')
+    if [ "$recorded" = "TG_PING_AGENT=off" ] && [ "$shown_off" = "agent     : not shown (TG_PING_AGENT=off)" ] &&
+       [ "$shown" = "agent     : Codex (detected)" ] && contains "$doctor" "[ ok ] agent" &&
+       contains "$doctor" "Codex (detected)"; then
+        ok "agent: config set agent, and config show and doctor say which agent is seen"
+    else
+        bad "agent: config set agent, and config show and doctor say which agent is seen" \
+            "$recorded / $shown_off / $shown / $doctor"
+    fi
+fi
+
+if describe "agent: a rich message and a Markdown report name the agent"; then
+    start_case
+    env -u TG_PING_AGENT TG_PING_MACHINE=laptop "$SANDBOX/agents/codex" "$TG" --rich --ok --title "R" "body" >/dev/null 2>&1
+    rich=$(field_value sendRichMessage rich_message)
+    printf '# Results\n\nThe sweep ended.\n' > "$SANDBOX/agent-report.md"
+    env -u TG_PING_AGENT "$SANDBOX/agents/codex" "$TG" rich "$SANDBOX/agent-report.md" --title "Opening" >/dev/null 2>&1
+    report=$(field_value sendRichMessage rich_message)
+    if contains "$rich" "<p>✅ 💻 laptop · Codex · <b>R</b></p>" && contains "$report" "Codex · **Opening**"; then
+        ok "agent: a rich message and a Markdown report name the agent"
+    else
+        bad "agent: a rich message and a Markdown report name the agent" "$rich / $report"
+    fi
 fi
 
 # --- help ------------------------------------------------------------------

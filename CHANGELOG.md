@@ -9,6 +9,37 @@
 
 This project follows semantic versioning.
 
+## 2.2.0
+
+Every message now says which agent wrote it. When several coding agents
+report through one bot, the phone showed the same sender for all of them;
+the first line now names the agent after the machine,
+`✅ 🖥️ office desktop · Codex · Tests green`, without the agent having to
+sign anything.
+
+### Which agent is speaking
+
+* The agent is found by itself: the nearest program above `tg-ping` that is
+  a coding agent (Claude Code, Codex, Grok, OpenCode, Gemini CLI,
+  Antigravity, Cursor, Copilot, Aider, Amp, Goose, Qwen Code, Crush, Droid,
+  Augment or Kiro), known by its name or, for a Node or Python program, by
+  its script. On Linux the chain of programs is read from `/proc`, without
+  starting any program, and elsewhere from `ps`. An agent started by another
+  one is named for itself.
+* A job that outlives its agent, such as a computation left running with
+  `nohup`, is named from the marks agents leave in the environment of their
+  commands: `AI_AGENT` first, then `CLAUDECODE`, `CODEX_THREAD_ID`,
+  `GROK_SESSION_ID`, `OPENCODE`, `ANTIGRAVITY_CONVERSATION_ID` and
+  `GEMINI_CLI`. A command typed by hand names no agent, and its messages
+  look as before.
+* The setting `TG_PING_AGENT` (`config set agent`) takes `auto`, the
+  default, `off`, or the name to show; `--agent NAME` gives the name for one
+  message and `--no-agent` leaves it out. The commands `config show` and
+  `doctor` say which agent is seen.
+* The hooks of Claude Code printed by `hook hooks` name no agent in their
+  titles ("Finished", "Needs you"), since Grok runs those hooks as well and
+  each message now says which agent is waiting.
+
 ## 2.1.0
 
 The conversation now goes both ways, and a message carries what it is

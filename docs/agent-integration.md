@@ -25,10 +25,14 @@ If an agent runs in a container or on a remote machine, put the credentials in
 the environment of that machine (`TG_PING_TOKEN`, `TG_PING_CHAT_ID`) rather
 than into the repository, and give the machine a name
 (`tg-ping config set machine "cluster"`, or `TG_PING_MACHINE`), so that you
-know which one is speaking. When several agents work on one machine, each in
-its own folder, `tg-ping config set project on` ends every message with the
-project it comes from (the folder inside its repository), so that you also
-know which one.
+know which one is speaking. Every message also names, after the machine, the
+agent that sent it (Claude, Codex, Grok, OpenCode, Gemini, Antigravity and
+others), which `tg-ping` finds by itself among the programs above it, so an
+agent never has to sign its messages; `tg-ping config show` says which agent it
+sees, and `TG_PING_AGENT` or `--agent NAME` gives the name when it cannot.
+When several agents work on one machine, each in its own folder,
+`tg-ping config set project on` ends every message with the project it comes
+from (the folder inside its repository), so that you also know which one.
 
 ## What to write in the project instructions
 
@@ -57,7 +61,9 @@ remembering. `tg-ping hook hooks` prints a `.claude/settings.json` fragment
 that fires when the session stops and when the agent is waiting for you. Each
 hook command carries `--no-stdin`, since Claude Code hands every hook a JSON
 document on standard input, and the stop hook a `--cooldown`, so that a burst
-of short sessions makes one message.
+of short sessions makes one message. Grok runs the hooks of Claude Code as
+well, so their titles ("Finished", "Needs you") name no agent: the first line
+of each message says which one is waiting.
 
 ## Codex and other agents
 

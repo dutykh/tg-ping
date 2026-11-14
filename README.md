@@ -35,6 +35,7 @@ file=$(tg-ping receive "Please send the referee's PDF" --wait 15m --out inbox/)
 * [Creating the Telegram bot](#creating-the-telegram-bot)
 * [Configuration](#configuration)
 * [Which machine is speaking](#which-machine-is-speaking)
+* [Which agent is speaking](#which-agent-is-speaking)
 * [Which project is speaking](#which-project-is-speaking)
 * [A topic per project](#a-topic-per-project)
 * [Everyday use](#everyday-use)
@@ -257,6 +258,7 @@ command line, in that increasing order of priority.
 | `TG_PING_CHAT_ID` | target chat, or a comma separated list of them | required |
 | `TG_PING_MACHINE` | the name of this machine, shown on every message | none |
 | `TG_PING_MACHINE_ICON` | its icon, recorded by `config set machine` | detected |
+| `TG_PING_AGENT` | the agent named after the machine: `auto`, `off`, or a name of your own | `auto` |
 | `TG_PING_PROJECT` | `on` to end every message with its project, or a name of your own | off |
 | `TG_PING_TOPICS` | `project` for one topic per project and machine | off |
 | `TG_PING_QUIET_HOURS` | hours without sound, such as `23-08` | none |
@@ -298,6 +300,7 @@ token from: /home/you/.config/tg-ping/default.env
 chat id   : 987654321
 chat from : /home/you/.config/tg-ping/default.env
 machine   : 💻 laptop
+agent     : Claude (detected)
 topics    : off
 quiet     : never
 format    : auto
@@ -365,6 +368,44 @@ icon and the host name, and `--no-machine` leaves the name out of one message.
 Host names are a poor guide (two of your machines may share one), which is why
 the name is chosen rather than read.
 
+## Which agent is speaking
+
+When several coding agents report through one bot, every message also says
+which of them wrote it: the agent's name follows the machine on the first
+line.
+
+```text
+✅ 🖥️ office desktop · Codex · Tests green
+⚠️ 💻 laptop · Grok · Needs you
+🚀 💻 laptop · Claude · Opening of the sweep
+```
+
+Nothing has to be configured, and the agent does not have to sign anything:
+`tg-ping` looks at the programs above it and takes the nearest one that is a
+coding agent. It knows Claude Code, Codex, Grok, OpenCode, Gemini CLI,
+Antigravity, Cursor, Copilot, Aider, Amp, Goose, Qwen Code, Crush, Droid,
+Augment and Kiro, by the name of the program or, for one written in Node or
+Python, by the name of its script. On Linux the chain is read from `/proc`,
+without starting any program; elsewhere `ps` lists it. The nearest agent
+wins, so an agent started by another one is named for itself. A job that
+outlives the agent that started it (a computation left running with `nohup`,
+say) is named from the marks agents leave in the environment of the commands
+they run, `AI_AGENT` first, then `CLAUDECODE`, `CODEX_THREAD_ID`,
+`GROK_SESSION_ID`, `OPENCODE`, `ANTIGRAVITY_CONVERSATION_ID` and `GEMINI_CLI`.
+A command typed by hand, a cron job or a CI run names no agent, and its
+messages look as before.
+
+The setting `TG_PING_AGENT` changes this: `off` names no agent, any other value
+is the name shown (`TG_PING_AGENT="Codex (review)"`), and `auto`, the default,
+finds it. For one message, `--agent NAME` gives the name and `--no-agent`
+leaves it out. The commands `tg-ping config show` and `tg-ping doctor` say which
+agent `tg-ping` sees from where they run:
+
+```bash
+tg-ping config show | grep agent      # agent     : Codex (detected)
+tg-ping config set agent off          # never name the agent on this machine
+```
+
 ## Which project is speaking
 
 Several agents may report from one machine at the same time, each from its
@@ -378,7 +419,7 @@ tg-ping config set project on
 ```
 
 ```text
-✅ 🖥️ office desktop · Tests green
+✅ 🖥️ office desktop · Codex · Tests green
 142 passed in 38 s
 
 📂 typst-vault/Proofs/Zipf
@@ -465,7 +506,7 @@ input belongs to something else.
 Every part is optional and they combine in a fixed order:
 
 ```text
- emoji  machine · bold title         --level, --emoji, the machine name, --title
+ emoji  machine · agent · title      --level, --emoji, the machine, the agent, --title
  body text                           positional text, -m, or stdin
  formula                             --math, repeatable
  picture, document                   --photo FILE, --document FILE, repeatable
@@ -878,6 +919,12 @@ it is blocked on a decision, and when the objective is complete, keeping each
 message to one or two sentences; it also says that a question may carry its
 figures and that `receive` fetches a file from the user. The guide
 [Letting an agent report to you](docs/agent-integration.md) goes further.
+
+Each message names the agent that sent it, after the machine, as
+[Which agent is speaking](#which-agent-is-speaking) explains, so the agent
+never needs to sign its messages, and the hooks of `tg-ping hook hooks` name
+none in their titles: Grok runs the hooks of Claude Code as well, and each
+message then says which of the two is waiting.
 
 Two options exist for the agent's own safety: `--cooldown SECONDS` drops
 repeats of the same alert, which protects your phone from a looping agent, and
