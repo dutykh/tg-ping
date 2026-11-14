@@ -43,6 +43,15 @@ sign anything.
   titles ("Finished", "Needs you"), since Grok runs those hooks as well and
   each message now says which agent is waiting.
 
+### Documentation
+
+The README gives the true number of cases of the test suite, 175, names the
+command word `send` and the command `version`, which it never mentioned,
+gives `media` its line in the table of what can be sent, and says how to
+cite the program. A citation file,
+`CITATION.cff`, lets GitHub show the reference through the "Cite this
+repository" button of the repository page.
+
 ## 2.1.0
 
 The conversation now goes both ways, and a message carries what it is

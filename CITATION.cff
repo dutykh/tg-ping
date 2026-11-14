@@ -1,0 +1,34 @@
+# Dr. Denys Dutykh (Mathematics Department, Khalifa University of Science and Technology, Abu Dhabi, UAE)
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "tg-ping: expressive Telegram notifications for terminals, coding agents and research scripts"
+type: software
+authors:
+  - family-names: Dutykh
+    given-names: Denys
+    affiliation: "Khalifa University of Science and Technology"
+    orcid: "https://orcid.org/0000-0001-5247-2788"
+repository-code: "https://github.com/dutykh/tg-ping"
+license: LGPL-2.1-or-later
+version: 2.2.0
+date-released: "2026-11-15"
+keywords:
+  - telegram
+  - telegram-bot
+  - notifications
+  - monitoring
+  - bash
+  - shell
+  - cli
+  - curl
+  - developer-tools
+  - ai-agents
+  - claude-code
+abstract: >-
+  One Bash file that sends Telegram messages from terminals, coding agents and research scripts,
+  with curl as its only hard requirement: milestones, code and tables, formulas typeset on the
+  machine, figures and pages of PDF files, and reports on long computations, which it can watch
+  for stalls and warning words. It can also ask a question and return the answer typed or tapped
+  on the phone, receive a file sent from the phone, and say on every message which machine, which
+  agent and which project is speaking. Configuration files are parsed and never executed, and the
+  token of the bot is never printed nor taken from the folder in which it runs.
