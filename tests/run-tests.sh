@@ -2228,6 +2228,10 @@ if describe "agent: the marks of the environment, when no program above is one";
     [ "$(field_value sendMessage text)" = "Codex · m" ] || wrong="$wrong sandbox"
     env -u TG_PING_AGENT TG_PING_PROC_DIR="$SANDBOX/noproc" AI_AGENT=true "$TG" "m" >/dev/null 2>&1
     [ "$(field_value sendMessage text)" = "m" ] || wrong="$wrong AI_AGENT=true"
+    # A value of AI_AGENT unknown here yields to the mark of a known agent.
+    env -u TG_PING_AGENT TG_PING_PROC_DIR="$SANDBOX/noproc" AI_AGENT=sidecar_7 \
+        ANTIGRAVITY_CONVERSATION_ID=c2 "$TG" "m" >/dev/null 2>&1
+    [ "$(field_value sendMessage text)" = "Antigravity · m" ] || wrong="$wrong unknown-yields"
     env -u TG_PING_AGENT TG_PING_PROC_DIR="$SANDBOX/noproc" "$TG" "m" >/dev/null 2>&1
     [ "$(field_value sendMessage text)" = "m" ] || wrong="$wrong none"
     check "agent: the marks of the environment, when no program above is one" "wrong:$wrong" \

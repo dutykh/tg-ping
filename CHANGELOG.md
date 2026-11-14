@@ -26,12 +26,15 @@ sign anything.
   its script. On Linux the chain of programs is read from `/proc`, without
   starting any program, and elsewhere from `ps`. An agent started by another
   one is named for itself.
-* A job that outlives its agent, such as a computation left running with
-  `nohup`, is named from the marks agents leave in the environment of their
-  commands: `AI_AGENT` first, then `CLAUDECODE`, `CODEX_THREAD_ID`,
-  `GROK_SESSION_ID`, `OPENCODE`, `ANTIGRAVITY_CONVERSATION_ID` and
-  `GEMINI_CLI`. A command typed by hand names no agent, and its messages
-  look as before.
+* Where the agent cannot be seen, inside the sandbox of Codex, whose own
+  process namespace hides every program outside it, or in a job that
+  outlives its agent, such as a computation left running with `nohup`, the
+  marks agents leave in the environment of their commands decide: those of
+  the Codex sandbox first, then `AI_AGENT`, then `CLAUDECODE`,
+  `CODEX_THREAD_ID`, `GROK_SESSION_ID`, `OPENCODE`,
+  `ANTIGRAVITY_CONVERSATION_ID` and `GEMINI_CLI`, and last a value of
+  `AI_AGENT` naming an agent unknown to the tool. A command typed by hand
+  names no agent, and its messages look as before.
 * The setting `TG_PING_AGENT` (`config set agent`) takes `auto`, the
   default, `off`, or the name to show; `--agent NAME` gives the name for one
   message and `--no-agent` leaves it out. The commands `config show` and

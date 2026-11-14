@@ -387,10 +387,12 @@ Antigravity, Cursor, Copilot, Aider, Amp, Goose, Qwen Code, Crush, Droid,
 Augment and Kiro, by the name of the program or, for one written in Node or
 Python, by the name of its script. On Linux the chain is read from `/proc`,
 without starting any program; elsewhere `ps` lists it. The nearest agent
-wins, so an agent started by another one is named for itself. A job that
-outlives the agent that started it (a computation left running with `nohup`,
-say) is named from the marks agents leave in the environment of the commands
-they run, `AI_AGENT` first, then `CLAUDECODE`, `CODEX_THREAD_ID`,
+wins, so an agent started by another one is named for itself. Where the agent
+cannot be seen, the marks agents leave in the environment of the commands they
+run decide: inside the sandbox of Codex, whose own process namespace hides
+every program outside it, and in a job that outlives the agent that started it
+(a computation left running with `nohup`, say). The marks of the Codex sandbox
+come first, then `AI_AGENT`, then `CLAUDECODE`, `CODEX_THREAD_ID`,
 `GROK_SESSION_ID`, `OPENCODE`, `ANTIGRAVITY_CONVERSATION_ID` and `GEMINI_CLI`.
 A command typed by hand, a cron job or a CI run names no agent, and its
 messages look as before.

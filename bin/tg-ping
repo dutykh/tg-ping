@@ -364,14 +364,15 @@ agent_from_env() {
     # hides every program outside it, or a job left running in the
     # background. The marks of that sandbox come first, since they hold
     # only inside it; then AI_AGENT, which several agents set for their
-    # commands, replacing the value of an agent that started them.
+    # commands, replacing the value of an agent that started them; then the
+    # marks of each agent; and last a value of AI_AGENT that names an agent
+    # unknown here, by its first word.
     local v
     if [ -n "${CODEX_SANDBOX:-}${CODEX_SANDBOX_NETWORK_DISABLED:-}" ]; then
         printf 'Codex'; return 0
     fi
     v=$(lc "${AI_AGENT:-}")
     case "$v" in
-        ""|1|0|true|false|yes|no|on|off) ;;
         claude*)                   printf 'Claude'; return 0 ;;
         codex*)                    printf 'Codex'; return 0 ;;
         grok*)                     printf 'Grok'; return 0 ;;
@@ -380,11 +381,6 @@ agent_from_env() {
         antigravity*|agy*|jetski*) printf 'Antigravity'; return 0 ;;
         cursor*)                   printf 'Cursor'; return 0 ;;
         copilot*|github-copilot*)  printf 'Copilot'; return 0 ;;
-        [a-z]*)
-            # Another agent, named by the first word of its mark.
-            v=${AI_AGENT%%[_ ]*}
-            printf '%s%s' "$(printf '%s' "${v:0:1}" | tr '[:lower:]' '[:upper:]')" "${v:1}"
-            return 0 ;;
     esac
     if   [ -n "${CLAUDECODE:-}" ]; then printf 'Claude'
     elif [ -n "${CODEX_THREAD_ID:-}" ]; then printf 'Codex'
@@ -394,6 +390,13 @@ agent_from_env() {
     elif [ -n "${ANTIGRAVITY_CONVERSATION_ID:-}" ]; then printf 'Antigravity'
     elif [ -n "${GEMINI_CLI:-}" ]; then printf 'Gemini'
     elif [ -n "${CURSOR_AGENT:-}" ]; then printf 'Cursor'
+    else
+        case "$v" in
+            ""|1|0|true|false|yes|no|on|off) ;;
+            [a-z]*)
+                v=${AI_AGENT%%[_ ]*}
+                printf '%s%s' "$(printf '%s' "${v:0:1}" | tr '[:lower:]' '[:upper:]')" "${v:1}" ;;
+        esac
     fi
     return 0
 }
