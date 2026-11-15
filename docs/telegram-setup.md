@@ -111,7 +111,7 @@ The id appears in the link to the topic, as the number after the group id.
 
 Telegram also allows topics inside the private chat with a bot, made by the bot
 itself. With them, each project keeps its own thread on the phone, one per
-computer, named like `NLS-cavity · laptop`, instead of one long mixed stream.
+computer, named like `heat-equation · laptop`, instead of one long mixed stream.
 
 Topic mode belongs to the bot and is switched on once: in `@BotFather`, open
 the settings of your bot (`/mybots`, then the bot) and turn on **Threaded

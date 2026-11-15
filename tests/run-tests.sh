@@ -1705,11 +1705,11 @@ fi
 
 if describe "topics: each project gets its topic, made once"; then
     start_case
-    mkdir -p "$SANDBOX/NLS-cavity"
-    ( cd "$SANDBOX/NLS-cavity" && TG_PING_TOPICS=project TG_PING_MACHINE=laptop "$TG" "first" >/dev/null 2>&1 &&
+    mkdir -p "$SANDBOX/heat-equation"
+    ( cd "$SANDBOX/heat-equation" && TG_PING_TOPICS=project TG_PING_MACHINE=laptop "$TG" "first" >/dev/null 2>&1 &&
       TG_PING_TOPICS=project TG_PING_MACHINE=laptop "$TG" "second" >/dev/null 2>&1 )
     if [ "$(methods)" = "createForumTopic sendMessage sendMessage " ] &&
-       [ "$(field_value createForumTopic name)" = "NLS-cavity · laptop" ] &&
+       [ "$(field_value createForumTopic name)" = "heat-equation · laptop" ] &&
        [ "$(nth_field sendMessage 1 message_thread_id)" = "900" ] && [ "$(nth_field sendMessage 2 message_thread_id)" = "900" ]; then
         ok "topics: each project gets its topic, made once"
     else
@@ -1720,7 +1720,7 @@ fi
 if describe "topics: a deleted topic is made again"; then
     start_case
     queue sendMessage "400	{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message thread not found\"}"
-    ( cd "$SANDBOX/NLS-cavity" && TG_PING_TOPICS=project "$TG" "after the topic was deleted" >/dev/null 2>&1 )
+    ( cd "$SANDBOX/heat-equation" && TG_PING_TOPICS=project "$TG" "after the topic was deleted" >/dev/null 2>&1 )
     if [ "$(methods)" = "createForumTopic sendMessage createForumTopic sendMessage " ] &&
        [ "$(nth_field sendMessage 2 message_thread_id)" = "901" ]; then
         ok "topics: a deleted topic is made again"
@@ -1733,7 +1733,7 @@ if describe "topics: when no topic works the message goes to the main chat"; the
     start_case
     lost='400	{"ok":false,"error_code":400,"description":"Bad Request: message thread not found"}'
     queue sendMessage "$lost" "$lost"
-    ( cd "$SANDBOX/NLS-cavity" && TG_PING_TOPICS=project "$TG" "first" >/dev/null 2>&1 &&
+    ( cd "$SANDBOX/heat-equation" && TG_PING_TOPICS=project "$TG" "first" >/dev/null 2>&1 &&
       TG_PING_TOPICS=project "$TG" "second" >/dev/null 2>&1 ); rc=$?
     if [ "$rc" -eq 0 ] &&
        [ "$(methods)" = "createForumTopic sendMessage createForumTopic sendMessage sendMessage sendMessage " ] &&
@@ -1748,7 +1748,7 @@ fi
 if describe "topics: a bot without topic mode writes to the main chat"; then
     start_case
     queue createForumTopic '400	{"ok":false,"error_code":400,"description":"Bad Request: BOT_FORUM_CREATE_FORBIDDEN"}'
-    ( cd "$SANDBOX/NLS-cavity" && TG_PING_TOPICS=project "$TG" "first" >/dev/null 2>&1 &&
+    ( cd "$SANDBOX/heat-equation" && TG_PING_TOPICS=project "$TG" "first" >/dev/null 2>&1 &&
       TG_PING_TOPICS=project "$TG" "second" >/dev/null 2>&1 ); rc=$?
     if [ "$rc" -eq 0 ] && [ "$(methods)" = "createForumTopic sendMessage sendMessage " ] &&
        [ -z "$(nth_field sendMessage 1 message_thread_id)" ] && [ -z "$(nth_field sendMessage 2 message_thread_id)" ]; then

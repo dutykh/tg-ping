@@ -1116,7 +1116,7 @@ _safe_path() {
 TOPIC_FILE=""
 
 topic_name() {
-    # The name of this project's topic on this computer: "NLS-cavity · laptop".
+    # The name of this project's topic on this computer: "heat-equation · laptop".
     local root machine
     root=$(git rev-parse --show-toplevel 2>/dev/null) || root=""
     [ -n "$root" ] || root="$PWD"

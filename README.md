@@ -445,8 +445,8 @@ git repository, else the folder) and of its machine, made by the bot the first
 time:
 
 ```text
-NLS-cavity · laptop
-NLS-cavity · office desktop
+heat-equation · laptop
+heat-equation · office desktop
 referee-report · laptop
 ```
 

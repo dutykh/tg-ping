@@ -238,7 +238,7 @@ first.
   (laptop, desktop, or server and virtual machine) is detected once. An
   unnamed machine shows nothing, and `--no-machine` hides the name once.
 * With `TG_PING_TOPICS=project`, each project gets its own topic in the chat,
-  one per machine ("NLS-cavity · laptop"), made by the bot the first time and
+  one per machine ("heat-equation · laptop"), made by the bot the first time and
   made again if deleted. When topics cannot be used, messages go to the main
   chat.
 * The commands `edit` and `delete` correct or withdraw a message, by number or
